@@ -124,6 +124,7 @@ class ResolvedProfile:
     precision: str
     num_workers: int
     ort_provider: str
+    steps_per_second_min: float | None
     output_dir: Path
     max_steps: int
     eval_steps: int
@@ -140,6 +141,7 @@ class ResolvedProfile:
             "batch_size": self.batch_size,
             "precision": self.precision,
             "num_workers": self.num_workers,
+            "steps_per_second_min": self.steps_per_second_min,
         }
 
 
@@ -172,6 +174,7 @@ def resolve_profile(
         precision=hw["precision"],
         num_workers=hw["num_workers"],
         ort_provider=hw["ort_provider"],
+        steps_per_second_min=hw.get("steps_per_second_min"),
         output_dir=REPO_ROOT / tp["output_dir"],
         max_steps=tp["max_steps"],
         eval_steps=tp["eval_steps"],

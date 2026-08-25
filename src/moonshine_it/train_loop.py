@@ -135,11 +135,15 @@ def save_checkpoint(model, proc, optimizer, out_dir: Path, step: int,
     prev_best = json.loads(marker.read_text()) if marker.exists() else None
     score = metrics.get("eval_wer")
     if score is not None and (prev_best is None or score < prev_best["eval_wer"]):
-        import shutil
+        # O(1) promotion: point the best-checkpoint at the winning step via a
+        # symlink instead of copying the (potentially ~1.6 GB) checkpoint.
+        if best.is_symlink():
+            best.unlink()
+        elif best.exists():
+            import shutil
 
-        if best.exists():
-            shutil.rmtree(best)
-        shutil.copytree(ckpt, best)
+            shutil.rmtree(best)  # pre-existing real dir from before this change
+        best.symlink_to(ckpt, target_is_directory=True)
         marker.write_text(json.dumps({"global_step": step, "eval_wer": score}, indent=2))
     return ckpt
 
@@ -204,7 +208,7 @@ def train(
                     "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "dry_run": dry_run_steps is not None}, indent=2))
 
-    model, proc = load_model_and_processor(cfg, device=rp.device, dtype="fp32")
+    model, proc = load_model_and_processor(cfg, device=rp.device, dtype=rp.precision)
     model.train()
 
     is_smoke = training_profile == "smoke"
@@ -232,6 +236,8 @@ def train(
         num_workers=rp.num_workers,
         collate_fn=Collator(proc),
         drop_last=True,
+        persistent_workers=True,
+        pin_memory=True,
         generator=torch.Generator().manual_seed(cfg["smoke"]["seed"]),
     )
 
@@ -251,8 +257,10 @@ def train(
         start_step = state["global_step"]
         from transformers import AutoModelForSpeechSeq2Seq
 
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(str(latest),
-                                                          local_files_only=True).to(rp.device)
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            str(latest), local_files_only=True,
+            dtype={"bf16": torch.bfloat16, "fp32": torch.float32}[rp.precision],
+        ).to(rp.device)
         model.train()
         import torch as _t
 
@@ -282,6 +290,7 @@ def train(
             stage_loader = DataLoader(view, batch_size=rp.batch_size, shuffle=True,
                                       num_workers=rp.num_workers,
                                       collate_fn=Collator(proc), drop_last=True,
+                                      persistent_workers=True, pin_memory=True,
                                       generator=torch.Generator().manual_seed(
                                           cfg["smoke"]["seed"] + step))
         else:
@@ -293,6 +302,9 @@ def train(
             if step >= max_steps:
                 break
             batch = {k: v.to(rp.device) for k, v in batch.items()}
+            # bf16 weights require bf16 inputs (embedder linear dtype match)
+            if autocast_dtype is not None:
+                batch["input_values"] = batch["input_values"].to(autocast_dtype)
             ctx = (torch.autocast(device_type="cuda", dtype=autocast_dtype)
                    if autocast_dtype else contextlib.nullcontext())
             with ctx:
@@ -320,7 +332,7 @@ def train(
                 skipped += 1
                 continue
             optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             step += 1
             writer.add_scalar("train/loss", loss.item(), step)
             writer.add_scalar("train/grad_norm",
@@ -332,6 +344,7 @@ def train(
                       f"({(time.time()-t_start):.0f}s)", flush=True)
 
             if step % rp.eval_steps == 0:
+                torch.cuda.synchronize()  # scoped: settle the step before eval
                 optimizer.eval()
                 model.eval()
                 wer = quick_eval_wer(model, proc, val_manifest, val_audio, cfg)
@@ -341,6 +354,7 @@ def train(
                 print(f"  step {step} eval WER {wer:.1f}%", flush=True)
                 metrics = {"eval_wer": wer}
             if step % rp.save_steps == 0:
+                torch.cuda.synchronize()  # scoped: settle the step before saving
                 metrics = locals().get("metrics", {}) or {}
                 save_checkpoint(model, proc, optimizer, out_dir, step, metrics)
         epoch += 1
@@ -348,6 +362,29 @@ def train(
     metrics = locals().get("metrics", {}) or {}
     save_checkpoint(model, proc, optimizer, out_dir, step, metrics)
     writer.close()
+
+    # per-hardware performance gate: record measured wall-time/step and fail
+    # (mirroring eval gates) if it falls below the configured steps-per-second.
+    total_s = time.time() - t_start
+    done_steps = step - start_step
+    steps_per_second = done_steps / total_s if total_s > 0 else 0.0
+    meta = json.loads((out_dir / "run_metadata.json").read_text())
+    meta["wall_time_s"] = round(total_s, 1)
+    meta["steps_per_second"] = round(steps_per_second, 4)
+    meta["wall_time_per_step_s"] = round(total_s / done_steps, 4) if done_steps else None
+    (out_dir / "run_metadata.json").write_text(json.dumps(meta, indent=2))
+    if rp.steps_per_second_min is not None and done_steps > 0:
+        if steps_per_second < rp.steps_per_second_min:
+            raise SystemExit(
+                f"training-performance gate failed on {hardware_profile}: "
+                f"measured {steps_per_second:.3f} steps/s "
+                f"(allowed ≥ {rp.steps_per_second_min}); wall {total_s:.0f}s / "
+                f"{done_steps} steps. Optimize the loop (see "
+                f"openspec/changes/optimize-training-performance)."
+            )
+        print(f"  performance gate: {steps_per_second:.3f} steps/s "
+              f"(allowed ≥ {rp.steps_per_second_min}) — pass")
+
     print(f"train[{training_profile}]: done at step {step} -> {out_dir}")
     return out_dir
 

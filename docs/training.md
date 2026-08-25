@@ -32,6 +32,28 @@ uv run python train.py --profile smoke --hardware rocm12g --no-resume
 An interrupted run resumes at the recorded step without replaying optimizer
 state.
 
+## Performance profiling spike
+
+`task profile-steps PROFILE=<hw>` runs one training step under
+`torch.profiler` and writes a kernel/self-time/fraction-of-step table to
+`results/profile/<hw>/profile.json`, naming the single dominant kernel of
+the step. This is the gate for training-performance optimizations: an
+optimization is only accepted if its design cites the dominant kernel named
+here (see `openspec/changes/optimize-training-performance`).
+
+```bash
+task profile-steps PROFILE=strix     # name the dominant kernel of the slow step
+```
+
+## Per-hardware performance gate
+
+Each hardware profile in `config.yaml` carries a `steps_per_second_min`.
+After a training run the loop records measured `steps_per_second` /
+`wall_time_per_step_s` in `run_metadata.json` and, if it falls below the
+gate, fails the target with measured-vs-allowed values (mirroring the eval
+gates). Set the value from a measured run; a regression or a newly-added
+profile gets a number to hit instead of re-deriving a budget.
+
 ## Final training (Strix Halo)
 
 ```bash

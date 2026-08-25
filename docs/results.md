@@ -131,3 +131,47 @@ non-finite loss/grad skip guard, and forced math SDPA.
 
 Status: **running** (40k steps, curriculum 8k/16k/16k, eval + checkpoints
 every 1000 steps).
+
+## Training performance (per-hardware gate)
+
+After the `optimize-training-performance` change, every training run
+records `steps_per_second` / `wall_time_per_step_s` in `run_metadata.json`
+and is gated against each hardware profile's `steps_per_second_min`.
+
+| profile  | batch | measured (smoke dry-run)        | gate `steps_per_second_min` | verdict |
+|----------|-------|---------------------------------|------------------------------|---------|
+| rocm12g  | 8     | 0.496 steps/s (~2.0 s/step)     | 0.3                          | pass    |
+| strix    | 32    | **Benched.** A 26 GB ollama model (qwen3-vl:30b)     | —       | —       |
+|          |       | is pinned to the same unified-memory iGPU and causes |        |         |
+|          |       | intermittent pathological slowdowns (60–128 s/step)  |        |         |
+| cuda     | 16    | n/a                             | 0.3 (placeholder)            | —       |
+
+The rocm12g row was measured on a 35-step smoke dry-run with bf16 encoder
+weights (previously fp32 weights + fp32 matmuls). Final training runs on
+rocm12g.
+
+The Strix Halo row reflects the profiling spike
+`results/profile/strix/profile.json` (task 1.2): the dominant kernel of
+the step is **`aten::bmm`** (attention batched matmul, ~10% of step), which
+dispatches to rocBLAS GEMM kernels (`Cijk_..._MT32x32x8_..._ISA1151`). The
+spike confirmed bimodal behavior: the profiled step ran in **1.29 s** while
+two identical warmup steps took **123.1 s** — the same `bmm` shape
+occasionally selects a pathological rocBLAS kernel. Root cause: the Strix
+iGPU (Radeon 8060S, gfx1151) shares unified DDR DRAM with the desktop;
+ollama holds a 26 GB model at 100 % GPU on the same iGPU, creating
+compute and bandwidth contention that makes stable training unreliable.
+Final training targets rocm12g.
+
+## Training-performance optimizations (code)
+
+- **bf16 encoder weights**: `load_model_and_processor(dtype="bf16")` now
+  loads the streaming encoder in bf16 so matmuls run bf16 (RDNA-native)
+  instead of fp32; eval paths cast `input_values` to the model weight
+  dtype. Verified: bf16 forward+backward produces finite loss/grads and a
+  working eval WER on the smoke slice.
+- **No per-step device drain**: the every-step `torch.cuda.synchronize()`
+  (a gfx1200 workaround) is gone; syncs are scoped to save/eval
+  boundaries, and `zero_grad(set_to_none=True)` is used in the step.
+- **Data loading**: `persistent_workers=True` + `pin_memory=True`.
+- **Best-checkpoint promotion** is now a symlink (O(1)) instead of a
+  ~1.6 GB `copytree` per save (`checkpoint-best` remains loadable).

@@ -65,6 +65,9 @@ def transcribe_full(model, proc, audio: np.ndarray, max_tokens_per_s: float,
     # single-sample clips by the feature extractor.
     inputs = proc(audio=[audio], return_tensors="pt", sampling_rate=sr)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    # match the model's weight dtype (bf16 training checkpoints need bf16 input)
+    inputs["input_values"] = inputs["input_values"].to(
+        next(model.parameters()).dtype)
     dur = len(audio) / sr
     max_new = max(8, int(dur * max_tokens_per_s))
     with torch.no_grad():
@@ -85,7 +88,7 @@ def _verify_prefix(model, inputs, prefix) -> tuple[list[int], bool]:
         return list(prefix), True
     with torch.no_grad():
         out = model(
-            input_values=inputs["input_values"],
+            input_values=inputs["input_values"].to(next(model.parameters()).dtype),
             attention_mask=inputs.get("attention_mask"),
             decoder_input_ids=torch.tensor([prefix], device=model.device),
             use_cache=False,
@@ -125,6 +128,8 @@ def transcribe_streaming(
         chunk = audio[:end]
         inputs = proc(audio=[chunk], return_tensors="pt", sampling_rate=sr)
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        inputs["input_values"] = inputs["input_values"].to(
+            next(model.parameters()).dtype)
         dur = len(chunk) / sr
         token_budget = int(dur * max_tokens_per_s)
 

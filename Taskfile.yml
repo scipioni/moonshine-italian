@@ -84,6 +84,15 @@ tasks:
     cmds:
       - '{{.PY}} train.py --profile {{.TRAIN_PROFILE}} --hardware {{.PROFILE}}'
 
+  profile-steps:
+    desc: Profile one training step under torch.profiler (names dominant kernel)
+    deps: [profile-check]
+    preconditions:
+      - sh: test -f {{.SMOKE_MANIFEST}}
+        msg: "smoke manifest missing — run: task slice-smoke"
+    cmds:
+      - '{{.PY}} -m moonshine_it.profile_steps --hardware {{.PROFILE}}'
+
   final-train:
     desc: Multi-day final run (requires a recorded smoke success)
     deps: [profile-check]

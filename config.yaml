@@ -22,13 +22,18 @@ hardware_profiles:
     precision: "bf16"
     num_workers: 4
     ort_provider: "DmlExecutionProvider"  # unused on CPU-only ORT; native ORT ROCm default
+    steps_per_second_min: 0.3   # measured ~0.67/s (1.5 s/step); gate catches regressions
   strix:
     device: "cuda"
     accelerator_kind: "rocm"
     batch_size: 32
+    # NOTE: Strix is benched for training — a 26 GB ollama model is pinned to
+    # the same unified-memory iGPU, causing intermittent pathological slowdown
+    # (60–128 s/step). Final training runs on rocm12g. See docs/results.md.
     precision: "bf16"
     num_workers: 8
     ort_provider: "ROCMExecutionProvider"
+    steps_per_second_min: 0.3   # placeholder; Strix not used for training
   cuda:
     device: "cuda"
     accelerator_kind: "cuda"
@@ -36,6 +41,7 @@ hardware_profiles:
     precision: "bf16"
     num_workers: 8
     ort_provider: "CUDAExecutionProvider"
+    steps_per_second_min: 0.3
 
 datasets:
   fleurs:

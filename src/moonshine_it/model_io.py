@@ -20,16 +20,18 @@ def load_model_and_processor(
     """Load MoonshineStreaming model+processor from the local snapshot.
 
     dtype: "fp32" (parity/baseline safe) or "bf16" (training/fast eval).
-    Note: weights are always fp32 here; "bf16" currently still loads fp32
-    weights because the streaming encoder path has dtype-mismatch issues
-    with bf16 weights on ROCm. Use torch.autocast for bf16 compute.
+    With "bf16" the weights load in bf16 so matmuls run bf16 (RDNA-native)
+    instead of fp32. Callers MUST pass bf16 inputs (the streaming encoder's
+    embedder linear requires input and weight dtypes to match), e.g. via
+    torch.autocast or an explicit cast of `input_values` to bf16.
     """
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
     cfg = cfg or load_config()
     path = Path(model_path) if model_path else model_dir(cfg)
+    torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        str(path), local_files_only=True, dtype=torch.float32
+        str(path), local_files_only=True, dtype=torch_dtype
     )
     model.to(device)
     if device.startswith("cuda"):

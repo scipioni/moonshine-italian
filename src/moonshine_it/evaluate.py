@@ -1,0 +1,226 @@
+"""Evaluation harness: full-utterance and chunked-streaming modes.
+
+Streaming simulation mirrors the on-device runtime: audio is appended in
+hops; each re-decode teacher-forces the previous hypothesis, detects the
+first mismatch (speculative verification), and continues generation from
+that point. An excessive token rate (hallucination) truncates the line the
+same way the runtime's max_tokens_per_second heuristic does.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+from moonshine_it.normalize_it import normalize_text
+
+
+@dataclass
+class EvalResult:
+    model: str
+    dataset: str
+    split: str
+    mode: str                     # "full" | "streaming"
+    n: int
+    wer: float
+    cer: float
+    extra: dict = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        return json.dumps(self.__dict__, ensure_ascii=False, indent=2)
+
+
+def load_manifest(manifest: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in manifest.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def load_audio(path: Path, sr: int = 16000) -> np.ndarray:
+    import soundfile as sf
+
+    data, file_sr = sf.read(path, dtype="float32", always_2d=True)
+    if data.shape[1] > 1:
+        data = data.mean(axis=1)
+    else:
+        data = data[:, 0]  # always return 1-D; 2-D input corrupts batching
+    if file_sr != sr:
+        from moonshine_it.prepare import to_target_sr
+
+        data = to_target_sr(data, file_sr, sr)
+    return data
+
+
+def transcribe_full(model, proc, audio: np.ndarray, max_tokens_per_s: float,
+                    sr: int = 16000) -> str:
+    import torch
+
+    # NB: audio must be a LIST — a bare 1-D array is treated as a batch of
+    # single-sample clips by the feature extractor.
+    inputs = proc(audio=[audio], return_tensors="pt", sampling_rate=sr)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    dur = len(audio) / sr
+    max_new = max(8, int(dur * max_tokens_per_s))
+    with torch.no_grad():
+        ids = model.generate(
+            input_values=inputs["input_values"],
+            attention_mask=inputs.get("attention_mask"),
+            max_new_tokens=max_new,
+            do_sample=False,
+        )[0]
+    return proc.tokenizer.decode(ids, skip_special_tokens=True)
+
+
+def _verify_prefix(model, inputs, prefix) -> tuple[list[int], bool]:
+    """Teacher-force prefix; return (tokens up to first mismatch, changed)."""
+    import torch
+
+    if len(prefix) <= 1:
+        return list(prefix), True
+    with torch.no_grad():
+        out = model(
+            input_values=inputs["input_values"],
+            attention_mask=inputs.get("attention_mask"),
+            decoder_input_ids=torch.tensor([prefix], device=model.device),
+            use_cache=False,
+        )
+    # logits[i] predicts token prefix[i+1]
+    logits = out.logits[0].argmax(dim=-1).tolist()
+    kept = [prefix[0]]
+    changed = False
+    for i in range(1, len(prefix)):
+        if logits[i - 1] == prefix[i]:
+            kept.append(prefix[i])
+        else:
+            changed = True
+            break
+    return kept, changed
+
+
+def transcribe_streaming(
+    model,
+    proc,
+    audio: np.ndarray,
+    *,
+    hop_ms: int,
+    max_tokens_per_s: float,
+    speculative: bool = True,
+    sr: int = 16000,
+) -> tuple[str, dict]:
+    """Chunked streaming decode. Returns (text, timing stats)."""
+    import torch
+
+    hop = int(sr * hop_ms / 1000)
+    prefix = [proc.tokenizer.bos_token_id]
+    latencies: list[float] = []
+    compute_s = 0.0
+
+    for end in range(hop, len(audio) + 1, hop):
+        chunk = audio[:end]
+        inputs = proc(audio=[chunk], return_tensors="pt", sampling_rate=sr)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        dur = len(chunk) / sr
+        token_budget = int(dur * max_tokens_per_s)
+
+        t0 = time.perf_counter()
+        if speculative and len(prefix) > 1:
+            prefix, _changed = _verify_prefix(model, inputs, prefix)
+        remaining = max(4, token_budget - len(prefix) + 1)
+        with torch.no_grad():
+            ids = model.generate(
+                input_values=inputs["input_values"],
+                attention_mask=inputs.get("attention_mask"),
+                decoder_input_ids=torch.tensor([prefix], device=model.device),
+                max_new_tokens=min(remaining, 32),
+                do_sample=False,
+            )[0].tolist()
+        latencies.append(time.perf_counter() - t0)
+        compute_s += latencies[-1]
+
+        prefix = ids
+        # Hallucination guard: token rate too high -> truncate and freeze.
+        if len(prefix) - 1 > token_budget:
+            prefix = [prefix[0]] + prefix[1: token_budget + 1]
+            break
+
+    text = proc.tokenizer.decode(prefix, skip_special_tokens=True)
+    stats = {
+        "hops": len(latencies),
+        "redecode_latency_ms_mean": round(1000 * float(np.mean(latencies)), 1)
+        if latencies else None,
+        "redecode_latency_ms_p95": round(1000 * float(np.percentile(latencies, 95)), 1)
+        if latencies else None,
+        "compute_s": round(compute_s, 3),
+        "rtf": round(compute_s / (len(audio) / sr), 3),
+    }
+    return text, stats
+
+
+def evaluate_manifest(
+    model,
+    proc,
+    manifest_path: Path,
+    audio_root: Path,
+    *,
+    mode: str,
+    streaming_cfg: dict,
+    limit: int | None = None,
+    model_name: str = "model",
+    dataset: str = "dataset",
+    split: str = "test",
+) -> EvalResult:
+    import jiwer
+
+    rows = load_manifest(manifest_path)
+    if limit:
+        rows = rows[:limit]
+    refs: list[str] = []
+    hyps: list[str] = []
+    stats_all: list[dict] = []
+
+    for row in rows:
+        audio = load_audio(audio_root / row["audio"])
+        ref = normalize_text(row["text"], expand_nums=False)
+        if mode == "full":
+            hyp = transcribe_full(model, proc, audio,
+                                  max_tokens_per_s=streaming_cfg["max_tokens_per_second"])
+            stats_all.append({})
+        elif mode == "streaming":
+            hyp, stats = transcribe_streaming(
+                model, proc, audio,
+                hop_ms=streaming_cfg["hop_ms"],
+                max_tokens_per_s=streaming_cfg["max_tokens_per_second"],
+                speculative=streaming_cfg.get("speculative_decoding", True),
+            )
+            stats_all.append(stats)
+        else:
+            raise ValueError(f"unknown mode {mode}")
+        hyp = normalize_text(hyp, expand_nums=False)
+        refs.append(ref)
+        hyps.append(hyp)
+
+    wer = float(jiwer.wer(refs, hyps)) * 100
+    cer = float(jiwer.cer(refs, hyps)) * 100
+    extra: dict = {}
+    if mode == "streaming" and stats_all and stats_all[0]:
+        extra["redecode_latency_ms_mean"] = float(np.mean(
+            [s["redecode_latency_ms_mean"] for s in stats_all if s]))
+        extra["redecode_latency_ms_p95"] = float(np.mean(
+            [s["redecode_latency_ms_p95"] for s in stats_all if s]))
+        extra["rtf_mean"] = float(np.mean([s["rtf"] for s in stats_all if s]))
+    return EvalResult(
+        model=model_name, dataset=dataset, split=split, mode=mode,
+        n=len(rows), wer=round(wer, 2), cer=round(cer, 2), extra=extra,
+    )
+
+
+if __name__ == "__main__":
+    from moonshine_it.evaluate_cli import main
+
+    raise SystemExit(main())

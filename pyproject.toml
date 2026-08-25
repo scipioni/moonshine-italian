@@ -1,0 +1,47 @@
+[project]
+name = "moonshine-italian"
+version = "0.1.0"
+description = "Fine-tune Moonshine streaming-small for Italian streaming ASR"
+requires-python = ">=3.14"
+dependencies = [
+    "pyyaml>=6.0",
+    "numpy>=2.1",
+    "scipy>=1.15",
+    "soundfile>=0.13",
+    "transformers>=4.57",
+    "datasets>=4.0",
+    "huggingface-hub>=0.34",
+    "jiwer>=4.0",
+    "schedulefree>=1.4",
+    "tensorboard>=2.20",
+    "silero-vad>=5.1",
+    "onnx>=1.18",
+    "onnxruntime>=1.22",
+    "onnx-shrink-ray>=0.0.11",
+    "onnxscript>=0.7.1",
+]
+
+[project.scripts]
+moonshine-it = "moonshine_it.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moonshine_it"]
+
+[tool.uv]
+# Torch and (where installed natively) GPU ONNX Runtime come from Arch
+# pacman packages (python-pytorch-opt-rocm / -cuda, python-onnxruntime-rocm /
+# -cuda) and are visible through system-site-packages. Never pull torch or
+# GPU onnxruntime from PyPI here; the impossible marker drops the PyPI
+# requirement that silero-vad (and friends) would otherwise drag in.
+python-preference = "only-system"
+override-dependencies = [
+    "torch; sys_platform == 'never'",
+    "torchaudio; sys_platform == 'never'",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

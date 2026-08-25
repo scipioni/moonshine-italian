@@ -1,0 +1,199 @@
+version: '3'
+
+# Hardware profile: rocm12g | strix | cuda   (unset/invalid fails — no silent defaults)
+PROFILE: ''
+
+vars:
+  TRAIN_PROFILE: '{{default "smoke" .TRAIN_PROFILE}}'   # smoke | final
+  GATE: '{{default "smoke" .GATE}}'                     # smoke | final
+  DATASET: '{{default "fleurs" .DATASET}}'
+  CHECKPOINT: 'results/train-{{.TRAIN_PROFILE}}/checkpoint-best'
+  EXPORT_DIR: 'results/export/checkpoint-best'
+  RELEASE_DIR: 'artifacts/release/checkpoint-best'
+  SMOKE_MANIFEST: 'data/manifests/smoke/test.jsonl'
+  PY: 'uv run --no-sync python'
+
+env:
+  TOKENIZERS_PARALLELISM: 'false'
+
+tasks:
+  default:
+    desc: List targets
+    cmds:
+      - task --list
+
+  profile-check:
+    internal: true
+    cmds:
+      - |
+        case "{{.PROFILE}}" in
+          rocm12g|strix|cuda) ;;
+          *) echo "ERROR: PROFILE is unset or invalid: '{{.PROFILE}}'"; \
+             echo "valid profiles: rocm12g, strix, cuda"; \
+             echo "usage: task <target> PROFILE=rocm12g"; exit 1 ;;
+        esac
+
+  env-check:
+    desc: Verify GPU torch/ORT, accelerator kind, VRAM
+    deps: [profile-check]
+    cmds:
+      - '{{.PY}} -m moonshine_it.env_check --profile {{.PROFILE}}'
+
+  download-model:
+    desc: Fetch the base model snapshot (checksummed, idempotent)
+    cmds:
+      - '{{.PY}} -m moonshine_it.download model'
+
+  download-data:
+    desc: Fetch datasets (fleurs | mls | common_voice)
+    cmds:
+      - '{{.PY}} -m moonshine_it.download data {{.DATASET}}'
+
+  prepare:
+    desc: Prepare a dataset (16 kHz mono, VAD segmentation, manifests)
+    deps: [profile-check]
+    preconditions:
+      - sh: test -d data/hf-cache
+        msg: "dataset cache missing — run: task download-data DATASET={{.DATASET}}"
+    cmds:
+      - '{{.PY}} -m moonshine_it.prepare --dataset {{.DATASET}}'
+
+  slice-smoke:
+    desc: Deterministic smoke slice from prepared FLEURS-it
+    deps: [prepare]
+    cmds:
+      - '{{.PY}} -m moonshine_it.slice_smoke'
+
+  spike:
+    desc: Gradient / tokenizer / baseline spikes + verdict
+    deps: [profile-check]
+    preconditions:
+      - sh: test -f {{.SMOKE_MANIFEST}}
+        msg: "smoke manifest missing — run: task slice-smoke"
+    cmds:
+      - '{{.PY}} -m moonshine_it.spike all'
+
+  train:
+    desc: Fine-tune (TRAIN_PROFILE=smoke|final; spike latch enforced)
+    deps: [profile-check]
+    preconditions:
+      - sh: test -f {{.SMOKE_MANIFEST}}
+        msg: "prepared manifest missing — run: task prepare && task slice-smoke"
+      - sh: test -f results/spike/verdict.json
+        msg: "no spike verdict — run: task spike"
+    cmds:
+      - '{{.PY}} train.py --profile {{.TRAIN_PROFILE}} --hardware {{.PROFILE}}'
+
+  final-train:
+    desc: Multi-day final run (requires a recorded smoke success)
+    deps: [profile-check]
+    preconditions:
+      - sh: test -f results/smoke/record.json
+        msg: "no recorded smoke success — run the smoke chain first: task smoke PROFILE={{.PROFILE}}"
+    cmds:
+      - '{{.PY}} -m moonshine_it.gates require-smoke'
+      - '{{.PY}} train.py --profile final --hardware {{.PROFILE}}'
+
+  eval:
+    desc: Full + streaming WER/CER with gate check
+    deps: [profile-check]
+    preconditions:
+      - sh: test -d {{.CHECKPOINT}}
+        msg: "checkpoint missing — run: task train"
+      - sh: test -f {{.SMOKE_MANIFEST}}
+        msg: "smoke manifest missing — run: task slice-smoke"
+    cmds:
+      - '{{.PY}} -m moonshine_it.evaluate_cli --model {{.CHECKPOINT}} --mode both --name {{.TRAIN_PROFILE}} --gate {{.GATE}}'
+
+  export:
+    desc: PyTorch -> ONNX graphs (gate-checked; parity verified)
+    deps: [profile-check]
+    preconditions:
+      - sh: test -d {{.CHECKPOINT}}
+        msg: "checkpoint missing — run: task train"
+      - sh: test -f results/gates/{{.GATE}}.json
+        msg: "gate record missing — run: task eval GATE={{.GATE}}"
+    cmds:
+      - '{{.PY}} -m moonshine_it.export --model {{.CHECKPOINT}} --gate {{.GATE}}'
+      - '{{.PY}} -m moonshine_it.parity --model {{.CHECKPOINT}}'
+
+  ort:
+    desc: INT8 quantization + .ort serialization (size report)
+    deps: [profile-check]
+    preconditions:
+      - sh: test -f {{.EXPORT_DIR}}/decoder_kv.onnx
+        msg: "exported ONNX graphs missing — run: task export"
+    cmds:
+      - '{{.PY}} -m moonshine_it.quantize --model checkpoint-best'
+
+  ort-eval:
+    desc: Streaming eval of the INT8 .ort bundle + post-quant gate
+    deps: [profile-check]
+    preconditions:
+      - sh: test -f {{.RELEASE_DIR}}/decoder_kv.ort
+        msg: ".ort artifacts missing — run: task ort"
+      - sh: test -f results/eval/{{.TRAIN_PROFILE}}_streaming.json
+        msg: "pre-quant streaming result missing — run: task eval"
+    cmds:
+      - '{{.PY}} -m moonshine_it.ort_eval --model checkpoint-best --gate --name {{.TRAIN_PROFILE}}_int8 --delta-vs results/eval/{{.TRAIN_PROFILE}}_streaming.json'
+
+  validate:
+    desc: Validate + promote the .ort release bundle (checksums, smoke load, manifest)
+    deps: [profile-check]
+    preconditions:
+      - sh: test -f {{.RELEASE_DIR}}/decoder_kv.ort
+        msg: ".ort artifacts missing — run: task ort"
+      - sh: test -f results/gates/post_quant.json
+        msg: "post-quant gate record missing — run: task ort-eval"
+    cmds:
+      - '{{.PY}} -m moonshine_it.release --model checkpoint-best --gate'
+
+  release:
+    desc: "Full release chain: export -> quantize -> ort-eval -> validate"
+    deps: [export, ort, ort-eval, validate]
+    cmds:
+      - 'echo "release bundle ready: {{.RELEASE_DIR}}"'
+
+  board-deploy:
+    desc: Transfer the validated bundle to the UNO Q (scp + on-board checksums)
+    deps: [profile-check]
+    preconditions:
+      - sh: test -f {{.RELEASE_DIR}}/manifest.json
+        msg: "validated release bundle missing — run: task release"
+      - sh: 'test -n "$BOARD_HOST"'
+        msg: "board host not configured (set BOARD_HOST or edit scripts/board/deploy.sh)"
+    cmds:
+      - ./scripts/board/deploy.sh
+
+  # ---- single-command full-process smoke run ----
+  smoke:
+    desc: Chained end-to-end process validation on the FLEURS smoke slice
+    deps: [profile-check]
+    cmds:
+      - task: download-model
+      - task: download-data
+        vars: { DATASET: fleurs }
+      - task: prepare
+        vars: { DATASET: fleurs }
+      - task: slice-smoke
+      - task: spike
+      - task: train
+        vars: { TRAIN_PROFILE: smoke }
+      - task: eval
+        vars: { TRAIN_PROFILE: smoke, GATE: smoke }
+      - task: export
+        vars: { TRAIN_PROFILE: smoke, GATE: smoke }
+      - task: ort
+      - task: ort-eval
+        vars: { TRAIN_PROFILE: smoke }
+      - task: validate
+      - '{{.PY}} -m moonshine_it.gates record-smoke --phase download --phase prepare --phase slice-smoke --phase spike --phase train --phase eval --phase export --phase ort --phase ort-eval --phase validate --note "chained smoke run"'
+      - |
+        echo ""
+        echo "=== SMOKE SUMMARY ==="
+        for f in results/spike/verdict.json results/gates/smoke.json results/gates/post_quant.json; do
+          echo "--- $f"; cat "$f" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps({k: d[k] for k in ('ok','passed','measured_wer') if k in d}))" || echo "missing"
+        done
+        echo "--- parity"; python3 -c "import json; print('ok:', json.load(open('results/export/checkpoint-best/parity.json'))['ok'])"
+        echo "--- release"; ls {{.RELEASE_DIR}} | tr '\n' ' '; echo
+        echo "SMOKE: PASS"

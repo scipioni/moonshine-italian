@@ -1,0 +1,376 @@
+"""Profile-aware training loop: schedule-free AdamW, curriculum stages,
+chunked augmentation, checkpointing, TensorBoard.
+
+One code path for smoke and final profiles (only config differs).
+Resume: checkpoints carry trainer_state.json + optimizer.pt.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+
+from moonshine_it.config import REPO_ROOT, load_config, resolve_profile
+from moonshine_it.evaluate import load_audio
+from moonshine_it.model_io import load_model_and_processor
+from moonshine_it.prepare import plan_chunks, split_text_for_chunks
+
+
+class ASRDataset:
+    """Audio+text pairs from a prepared manifest, with chunked augmentation.
+
+    Augmentation re-splits an utterance into sentence-aligned sub-chunks
+    (same machinery as preparation) and keeps one at random — exposing the
+    model to partial utterances as seen in chunked streaming.
+    """
+
+    def __init__(self, manifest: Path, audio_root: Path, cfg: dict,
+                 *, max_audio_s: float | None = None, augment: bool = False,
+                 seed: int = 0):
+        from moonshine_it.evaluate import load_manifest
+
+        self.rows = load_manifest(manifest)
+        if max_audio_s is not None:
+            self.rows = [r for r in self.rows if r["duration_s"] <= max_audio_s]
+        self.audio_root = audio_root
+        self.cfg = cfg
+        self.augment = augment
+        self.seed = seed
+        self.min_len = int(cfg["preparation"]["min_duration_s"] * 16000)
+        self.max_len = int(cfg["preparation"]["max_duration_s"] * 16000)
+        aug = cfg["training"]["chunked_augmentation"]
+        self.augment_p = aug.get("probability", 0.0) if augment else 0.0
+        self.min_fraction = aug.get("min_fraction", 0.4)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i: int):
+        row = self.rows[i]
+        audio = load_audio(self.audio_root / row["audio"])
+        text = row["text"]
+        rng = random.Random(f"{self.seed}:{i}")
+        if self.augment_p and rng.random() < self.augment_p and len(audio) > self.min_len * 2:
+            # pretend this utterance is 2x max: split into 2 aligned chunks
+            half = max(self.min_len, len(audio) // 2)
+            chunks = plan_chunks([(0, len(audio))], len(audio), self.min_len,
+                                 max(half, self.min_len + 1))
+            if len(chunks) > 1:
+                texts = split_text_for_chunks(text, chunks)
+                if texts:
+                    ci = rng.randrange(len(chunks))
+                    cs, ce = chunks[ci]
+                    frac = (ce - cs) / len(audio)
+                    if frac >= self.min_fraction:
+                        audio, text = audio[cs:ce], texts[ci]
+        return {"audio": audio, "text": text}
+
+
+class Collator:
+    def __init__(self, proc):
+        self.proc = proc
+
+    def __call__(self, batch):
+        import torch
+
+        inputs = self.proc(
+            audio=[b["audio"] for b in batch],
+            text=[b["text"] for b in batch],
+            padding=True,
+            return_tensors="pt",
+            sampling_rate=16000,
+        )
+        labels = inputs["labels"]
+        # Two label conventions the processor gets wrong for this model:
+        # 1. It prepends BOS, but the loss aligns logits to labels without
+        #    re-shifting (decoder_start_token supplies the input-side BOS) —
+        #    training with BOS-in-labels teaches "BOS after BOS" and greedy
+        #    decode collapses to empty output.
+        # 2. It appends no EOS — the model then never learns to stop and
+        #    babbles to the generation cap (measured: eval WER ~330% from
+        #    pure insertions while transcription itself is correct).
+        tok = self.proc.tokenizer
+        bos, eos, pad = tok.bos_token_id, tok.eos_token_id, tok.pad_token_id
+        if labels.numel() and bool((labels[:, 0] == bos).all()):
+            labels = labels[:, 1:]
+        # grow by one column so even full-length rows get an EOS slot
+        labels = torch.nn.functional.pad(labels, (0, 1), value=pad)
+        pad_mask = labels == pad
+        first_pad = pad_mask.float().argmax(dim=1)
+        labels[torch.arange(labels.shape[0]), first_pad] = eos
+        labels = labels.masked_fill(labels == pad, -100)
+        labels = labels.masked_fill(labels == bos, -100)
+        inputs["labels"] = labels
+        return {k: v for k, v in inputs.items()}
+
+
+def stage_for_step(curriculum: list[dict], step: int) -> dict | None:
+    """Curriculum stages list cumulative step budgets."""
+    cumulative = 0
+    for stage in curriculum:
+        cumulative += stage["steps"]
+        if step < cumulative:
+            return stage
+    return curriculum[-1] if curriculum else None
+
+
+def save_checkpoint(model, proc, optimizer, out_dir: Path, step: int,
+                    metrics: dict) -> Path:
+    ckpt = out_dir / f"checkpoint-{step}"
+    ckpt.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(ckpt)
+    proc.save_pretrained(ckpt)
+    import torch
+
+    torch.save(optimizer.state_dict(), ckpt / "optimizer.pt")
+    (ckpt / "trainer_state.json").write_text(json.dumps(
+        {"global_step": step, "metrics": metrics}, indent=2))
+    best = out_dir / "checkpoint-best"
+    marker = out_dir / "best_metric.json"
+    prev_best = json.loads(marker.read_text()) if marker.exists() else None
+    score = metrics.get("eval_wer")
+    if score is not None and (prev_best is None or score < prev_best["eval_wer"]):
+        import shutil
+
+        if best.exists():
+            shutil.rmtree(best)
+        shutil.copytree(ckpt, best)
+        marker.write_text(json.dumps({"global_step": step, "eval_wer": score}, indent=2))
+    return ckpt
+
+
+def find_latest_checkpoint(out_dir: Path) -> Path | None:
+    if not out_dir.exists():
+        return None
+    ckpts = sorted(
+        (p for p in out_dir.glob("checkpoint-[0-9]*") if p.is_dir()
+         and (p / "trainer_state.json").exists()),
+        key=lambda p: int(p.name.split("-")[1]),
+    )
+    return ckpts[-1] if ckpts else None
+
+
+def quick_eval_wer(model, proc, manifest: Path, audio_root: Path, cfg: dict,
+                   limit: int = 8) -> float:
+    import jiwer
+
+    from moonshine_it.evaluate import (evaluate_manifest,
+                                       transcribe_full)
+
+    rows = [json.loads(l) for l in manifest.read_text().splitlines()][:limit]
+    max_tps = cfg["evaluation"]["streaming"]["max_tokens_per_second"]
+    refs, hyps = [], []
+    for row in rows:
+        audio = load_audio(audio_root / row["audio"])
+        hyp = transcribe_full(model, proc, audio, max_tokens_per_s=max_tps)
+        from moonshine_it.normalize_it import normalize_text
+
+        refs.append(normalize_text(row["text"], expand_nums=False))
+        hyps.append(normalize_text(hyp, expand_nums=False))
+    return float(jiwer.wer(refs, hyps)) * 100
+
+
+def train(
+    hardware_profile: str,
+    training_profile: str,
+    *,
+    dry_run_steps: int | None = None,
+    resume: bool = True,
+) -> Path:
+    import torch
+    from schedulefree import AdamWScheduleFree as ScheduleFreeAdamW
+    from torch.utils.data import DataLoader, Subset
+    from torch.utils.tensorboard import SummaryWriter
+
+    # torch-2.12 ROCm: the SDPA mem-efficient backward kernel intermittently
+    # produces inf gradients (decoder LayerNorm weights; measured 4/6 batches
+    # on MLS-it data -> NaN losses). The AOTriton flash path is numerically
+    # fine but ~300x slower here; the math fallback is both correct (~1/8
+    # inf-free-skip rate) and fast under bf16 autocast.
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_flash_sdp(False)
+
+    cfg = load_config()
+    rp = resolve_profile(cfg, hardware_profile, training_profile)
+    out_dir = rp.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "run_metadata.json").write_text(
+        json.dumps({**rp.run_metadata(),
+                    "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "dry_run": dry_run_steps is not None}, indent=2))
+
+    model, proc = load_model_and_processor(cfg, device=rp.device, dtype="fp32")
+    model.train()
+
+    is_smoke = training_profile == "smoke"
+    smoke_root = REPO_ROOT / cfg["smoke"]["slice_manifest"]
+    if is_smoke:
+        manifest = smoke_root / "train.jsonl"
+        audio_root = smoke_root / "audio"
+        val_manifest = smoke_root / "test.jsonl"
+        val_audio = smoke_root / "audio"
+    else:
+        data_root = REPO_ROOT / cfg["paths"]["data"] / "prepared" / "mls"
+        manifest = data_root / "train.jsonl"
+        audio_root = data_root
+        val_manifest = data_root / "validation.jsonl"
+        val_audio = data_root
+    if not manifest.exists():
+        raise SystemExit(f"training manifest missing: {manifest} — run prepare first")
+
+    dataset = ASRDataset(manifest, audio_root, cfg, augment=True,
+                         seed=cfg["smoke"]["seed"])
+    loader = DataLoader(
+        dataset,
+        batch_size=rp.batch_size,
+        shuffle=True,
+        num_workers=rp.num_workers,
+        collate_fn=Collator(proc),
+        drop_last=True,
+        generator=torch.Generator().manual_seed(cfg["smoke"]["seed"]),
+    )
+
+    tcfg = cfg["training"]
+    optimizer = ScheduleFreeAdamW(
+        model.parameters(),
+        lr=tcfg["learning_rate"],
+        betas=tuple(tcfg["betas"]),
+        weight_decay=tcfg["weight_decay"],
+        warmup_steps=tcfg["warmup_steps"],
+    )
+
+    start_step = 0
+    latest = find_latest_checkpoint(out_dir)
+    if resume and latest is not None:
+        state = json.loads((latest / "trainer_state.json").read_text())
+        start_step = state["global_step"]
+        from transformers import AutoModelForSpeechSeq2Seq
+
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(str(latest),
+                                                          local_files_only=True).to(rp.device)
+        model.train()
+        import torch as _t
+
+        optimizer.load_state_dict(_t.load(latest / "optimizer.pt",
+                                          map_location=rp.device, weights_only=False))
+        print(f"resume: from step {start_step} ({latest.name})")
+
+    max_steps = dry_run_steps if dry_run_steps is not None else rp.max_steps
+    writer = SummaryWriter(log_dir=str(out_dir / "runs"))
+    autocast_dtype = {"bf16": torch.bfloat16, "fp32": None}[rp.precision]
+    import contextlib
+
+    print(f"train[{training_profile}]: steps {start_step}..{max_steps}, "
+          f"batch={rp.batch_size}, device={rp.device} ({rp.accelerator_kind}), "
+          f"samples={len(dataset)}")
+
+    step = start_step
+    epoch = 0
+    t_start = time.time()
+    while step < max_steps:
+        # curriculum: rebuild dataset view for the current stage
+        stage = stage_for_step(rp.curriculum, step) if rp.curriculum else None
+        max_audio_s = stage["max_audio_s"] if stage else None
+        if max_audio_s:
+            view = Subset(dataset, [i for i, r in enumerate(dataset.rows)
+                                    if r["duration_s"] <= max_audio_s])
+            stage_loader = DataLoader(view, batch_size=rp.batch_size, shuffle=True,
+                                      num_workers=rp.num_workers,
+                                      collate_fn=Collator(proc), drop_last=True,
+                                      generator=torch.Generator().manual_seed(
+                                          cfg["smoke"]["seed"] + step))
+        else:
+            stage_loader = loader
+
+        optimizer.train()
+        skipped = 0
+        for batch in stage_loader:
+            if step >= max_steps:
+                break
+            batch = {k: v.to(rp.device) for k, v in batch.items()}
+            ctx = (torch.autocast(device_type="cuda", dtype=autocast_dtype)
+                   if autocast_dtype else contextlib.nullcontext())
+            with ctx:
+                out = model(input_values=batch["input_values"],
+                            attention_mask=batch.get("attention_mask"),
+                            labels=batch["labels"])
+                loss = out.loss
+            loss.backward()
+            # Untuned-on-Italian checkpoints produce huge LayerNorm gradients
+            # (confidently-wrong predictions over a 32k vocab; measured
+            # ~4e7 pre-clip) which overflow to inf across the deep backward
+            # chain. Clip every step; skip any step whose loss/grads are
+            # already non-finite so bad weights can't poison the run.
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                skipped += 1
+                if skipped <= 10 or skipped % 100 == 0:
+                    print(f"  step {step}: non-finite loss, skipping "
+                          f"({skipped} skipped so far)", flush=True)
+                continue
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=1.0)
+            if not torch.isfinite(grad_norm):
+                optimizer.zero_grad(set_to_none=True)
+                skipped += 1
+                continue
+            optimizer.step()
+            optimizer.zero_grad()
+            step += 1
+            writer.add_scalar("train/loss", loss.item(), step)
+            writer.add_scalar("train/grad_norm",
+                              float(grad_norm) if torch.is_tensor(grad_norm)
+                              else grad_norm, step)
+            if step % 10 == 0:
+                print(f"  step {step}/{max_steps} loss {loss.item():.4f} "
+                      f"gnorm {float(grad_norm):.2f} "
+                      f"({(time.time()-t_start):.0f}s)", flush=True)
+
+            if step % rp.eval_steps == 0:
+                optimizer.eval()
+                model.eval()
+                wer = quick_eval_wer(model, proc, val_manifest, val_audio, cfg)
+                model.train()
+                optimizer.train()
+                writer.add_scalar("eval/wer", wer, step)
+                print(f"  step {step} eval WER {wer:.1f}%", flush=True)
+                metrics = {"eval_wer": wer}
+            if step % rp.save_steps == 0:
+                metrics = locals().get("metrics", {}) or {}
+                save_checkpoint(model, proc, optimizer, out_dir, step, metrics)
+        epoch += 1
+
+    metrics = locals().get("metrics", {}) or {}
+    save_checkpoint(model, proc, optimizer, out_dir, step, metrics)
+    writer.close()
+    print(f"train[{training_profile}]: done at step {step} -> {out_dir}")
+    return out_dir
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hardware", default="rocm12g")
+    parser.add_argument("--profile", default="smoke", choices=["smoke", "final"])
+    parser.add_argument("--dry-run-steps", type=int, default=None)
+    parser.add_argument("--no-resume", action="store_true")
+    args = parser.parse_args(argv)
+    from moonshine_it.gates import require_smoke_ok, require_spike_ok
+
+    require_spike_ok()               # fallback latch: no training without spikes
+    if args.profile == "final":       # final-train latch: process validated by smoke
+        require_smoke_ok()
+    out = train(args.hardware, args.profile,
+                dry_run_steps=args.dry_run_steps, resume=not args.no_resume)
+    print(f"output: {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

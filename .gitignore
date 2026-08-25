@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Environment
+.venv/
+.env
+
+# Pipeline products
+data/
+results/
+artifacts/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

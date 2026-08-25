@@ -1,0 +1,167 @@
+# moonshine-italian: pipeline configuration (single source of truth).
+# Private values (HF_TOKEN) live in .env, never here.
+
+base_model:
+  id: "moonshine-ai/moonshine-streaming-small"
+  architecture: "streaming-small"
+  params_million: 123
+  # Fallback ladder (design D3). One of: "streaming-small", "non_streaming_base", "lora"
+  selected_base: "streaming-small"
+
+paths:
+  data: "data"
+  results: "results"
+  artifacts: "artifacts"
+  hf_cache: "data/hf-cache"
+
+hardware_profiles:
+  rocm12g:
+    device: "cuda"          # ROCm surfaces as cuda/HIP in torch
+    accelerator_kind: "rocm"
+    batch_size: 8
+    precision: "bf16"
+    num_workers: 4
+    ort_provider: "DmlExecutionProvider"  # unused on CPU-only ORT; native ORT ROCm default
+  strix:
+    device: "cuda"
+    accelerator_kind: "rocm"
+    batch_size: 32
+    precision: "bf16"
+    num_workers: 8
+    ort_provider: "ROCMExecutionProvider"
+  cuda:
+    device: "cuda"
+    accelerator_kind: "cuda"
+    batch_size: 16
+    precision: "bf16"
+    num_workers: 8
+    ort_provider: "CUDAExecutionProvider"
+
+datasets:
+  fleurs:
+    repo: "google/fleurs"
+    config: "it_it"
+    enabled: true
+    gated: false
+  mls:
+    repo: "facebook/multilingual_librispeech"
+    config: "italian"
+    enabled: true
+    gated: false
+    parquet:
+      repo: "facebook/multilingual_librispeech"
+      splits:
+        train: "italian/train-*.parquet"
+        validation: "italian/dev-*.parquet"
+        test: "italian/test-*.parquet"
+  common_voice:
+    repo: "mozilla-foundation/common_voice_21_0"
+    config: "it"
+    enabled: false
+    gated: true
+    # unavailable: all mozilla-foundation/common_voice_* dataset repos were
+    # removed from the HF hub (404); 17_0 survives as an empty README shell.
+    # Optional mix-in per design D4 — training proceeds MLS-only.
+
+preparation:
+  target_sr: 16000
+  mono: true
+  min_duration_s: 1.0
+  max_duration_s: 10.0
+  vad:
+    backend: "silero"        # "silero" or "energy"
+    threshold: 0.5
+    min_speech_ms: 250
+    min_silence_ms: 100
+  transcript_normalization:
+    lowercase: true
+    expand_numbers: true
+    keep_accents: true       # always true in code; recorded for clarity
+
+smoke:
+  dataset: "fleurs"
+  train_samples: 200
+  eval_samples: 40
+  seed: 1234
+  max_train_steps: 60
+  slice_manifest: "data/manifests/smoke"
+
+training:
+  optimizer: "schedulefree_adamw"
+  learning_rate: 5.0e-5
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  warmup_steps: 500
+  chunked_augmentation:
+    enabled: true
+    probability: 0.3
+    min_fraction: 0.4        # keep at least this fraction of each utterance
+  profiles:
+    smoke:
+      output_dir: "results/train-smoke"
+      max_steps: 60
+      eval_steps: 30
+      save_steps: 30
+      curriculum: []          # no staging on smoke: single short stage
+      gate: "smoke"
+    final:
+      output_dir: "results/train-final"
+      max_steps: 40000
+      eval_steps: 1000
+      save_steps: 1000
+      curriculum:
+        - { steps: 8000, max_audio_s: 5.0, description: "short clips" }
+        - { steps: 16000, max_audio_s: 10.0, description: "medium clips" }
+        - { steps: 16000, max_audio_s: 30.0, description: "full length" }
+      gate: "final"
+
+evaluation:
+  full_utterance: true
+  streaming:
+    enabled: true
+    hop_ms: 100              # allowed range 32..100
+    speculative_decoding: true
+    max_tokens_per_second: 13.0
+  jiwer:
+    wer: true
+    cer: true
+  gates:
+    smoke:                   # process-validation gate, relative to baseline
+      mode: "full"
+      max_wer: 1.10          # ratio vs spike baseline WER on the same slice
+      relative_to: "baseline"
+      note: "smoke gate validates the process; compare against baseline JSON"
+    final:
+      mode: "streaming"
+      max_wer: 0.15          # absolute streaming WER
+      relative_to: "absolute"
+      full_utterance_wer_max: 0.20
+    post_quant:              # INT8 .ort bundle vs the pre-quant checkpoint
+      mode: "streaming"
+      max_wer: 1.25          # ratio vs the same checkpoint's streaming WER
+      relative_to: "baseline"
+      note: >
+        post-quantization degradation gate; measured on the .ort bundle in
+        streaming mode, baseline = the PyTorch checkpoint's streaming WER
+        on the same slice. Blocks release promotion on failure.
+
+export:
+  onnx:
+    tolerance: 2.0e-2
+    opset: 17
+  quantization: "int8"       # int8 | fp16 | none
+  ort:
+    size_report: true
+
+release:
+  dir: "artifacts/release"
+
+board:
+  host: "arduino@moonshine.local"                   # set in .env as BOARD_HOST for private deployment info
+  user: "root"
+  deploy_path: "/opt/moonshine-it"
+  test_clip: "artifacts/test/it_test_clip.wav"
+  budget:
+    redecode_ms_max: 1500
+    line_latency_ms_max: 3000
+    rss_mb_max: 2048

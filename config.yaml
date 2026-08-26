@@ -19,10 +19,26 @@ hardware_profiles:
     device: "cuda"          # ROCm surfaces as cuda/HIP in torch
     accelerator_kind: "rocm"
     batch_size: 8
+    # bf16: hit a 100% deterministic amdgpu VM page fault (GCVM_L2_
+    # PROTECTION_FAULT) at a fixed step/batch during final training. Ruled
+    # out: corrupt audio (scanned clean), DataLoader workers (crashes with
+    # num_workers=0 too), a single large gradient spike (added a >150 gnorm
+    # skip guard -- never triggered, crash unchanged), corrupted weights
+    # (0 non-finite values, normal magnitudes right before the fatal batch).
+    # A checkpoint round-trip's tiny precision perturbation was enough to
+    # avoid the crash entirely -- this is a knife-edge bf16 numerical/kernel
+    # edge case, not a robust one.
+    # Tried fp32 as a workaround: this GPU's fp32 matmul throughput is
+    # catastrophically worse than bf16 (not a small multiplier -- ~15-60x
+    # slower and erratic, turning the ~11.5h run into an estimated 2-3
+    # weeks). Reverted to bf16 as unusable in fp32 for this workload. Next
+    # real diagnostic step is rocgdb + a captured coredump (currently
+    # blocked on rocgdb not being installed) to identify the actual faulting
+    # kernel.
     precision: "bf16"
     num_workers: 4
     ort_provider: "DmlExecutionProvider"  # unused on CPU-only ORT; native ORT ROCm default
-    steps_per_second_min: 0.3   # measured ~0.67/s (1.5 s/step); gate catches regressions
+    steps_per_second_min: 0.3   # measured ~1.7/s
   strix:
     device: "cuda"
     accelerator_kind: "rocm"
@@ -107,6 +123,31 @@ training:
   betas: [0.9, 0.999]
   weight_decay: 0.01
   warmup_steps: 500
+  # Skip the optimizer step (in addition to the existing non-finite skip
+  # below) when the pre-clip grad norm exceeds this, even though it's
+  # finite. General safety net -- kept even though it did NOT explain or fix
+  # the rocm12g crash documented at shuffle_seed below (that crash's peak
+  # gnorm was 77.5, well under this).
+  max_grad_norm_skip: 150.0
+  # DataLoader shuffle seed (train_loop.py), deliberately separate from
+  # smoke.seed: on rocm12g, resuming training from checkpoint-1000 hit a
+  # 100% deterministic amdgpu VM page fault (GCVM_L2_PROTECTION_FAULT) at a
+  # fixed step/batch, every single retry -- because that resume always
+  # rebuilt the DataLoader with the same seed (smoke.seed + start_step),
+  # producing the identical shuffle order and re-walking into the same fault
+  # every time. Root cause not found despite a full investigation: not
+  # corrupt audio (scanned clean), not DataLoader workers (crashes with
+  # num_workers=0 too), not a single large gradient spike (max_grad_norm_skip
+  # above never triggered), not corrupted weights (0 non-finite values,
+  # normal magnitudes right before the fatal batch), not fp32 vs bf16 alone
+  # (fp32 sidesteps it but is 15-60x slower on this GPU, impractical), and a
+  # captured GPU coredump couldn't be parsed by rocgdb (gfx1200/RDNA4 is very
+  # new hardware; likely a ROCm 7.2.4 tooling gap, not something fixable
+  # here). This value only changes which shuffle order training uses --
+  # bumping it is a workaround (escapes this specific deterministic path),
+  # not a fix. If a similar hard crash recurs, don't assume changing this
+  # again will help twice.
+  shuffle_seed: 20260826
   chunked_augmentation:
     enabled: true
     probability: 0.3

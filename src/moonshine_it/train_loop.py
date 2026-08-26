@@ -8,6 +8,7 @@ Resume: checkpoints carry trainer_state.json + optimizer.pt.
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from dataclasses import asdict
@@ -275,6 +276,15 @@ def train(
             print(f"train[{training_profile}]: +{name} "
                   f"({len(parts[-1])} rows, {data_manifest})")
         dataset = parts[0] if len(parts) == 1 else MultiASRDataset(parts)
+    # Deliberately separate from cfg["smoke"]["seed"] (which still seeds
+    # per-item augmentation via ASRDataset above) -- see training.shuffle_seed
+    # in config.yaml for why. MOONSHINE_SHUFFLE_SEED lets a retry wrapper vary
+    # this per attempt after a hard crash, since resuming with an unchanged
+    # seed deterministically re-walks into the same fault (confirmed: it
+    # recurred even after one reseed, at a different but nearby step).
+    shuffle_seed = int(os.environ.get(
+        "MOONSHINE_SHUFFLE_SEED",
+        cfg["training"].get("shuffle_seed", cfg["smoke"]["seed"])))
     loader = DataLoader(
         dataset,
         batch_size=rp.batch_size,
@@ -284,7 +294,7 @@ def train(
         drop_last=True,
         persistent_workers=True,
         pin_memory=True,
-        generator=torch.Generator().manual_seed(cfg["smoke"]["seed"]),
+        generator=torch.Generator().manual_seed(shuffle_seed),
     )
 
     tcfg = cfg["training"]
@@ -336,7 +346,7 @@ def train(
 
     print(f"train[{training_profile}]: steps {start_step}..{max_steps}, "
           f"batch={rp.batch_size}, device={rp.device} ({rp.accelerator_kind}), "
-          f"samples={len(dataset)}")
+          f"samples={len(dataset)}, shuffle_seed={shuffle_seed}")
 
     step = start_step
     epoch = 0
@@ -353,7 +363,7 @@ def train(
                                       collate_fn=Collator(proc), drop_last=True,
                                       persistent_workers=True, pin_memory=True,
                                       generator=torch.Generator().manual_seed(
-                                          cfg["smoke"]["seed"] + step))
+                                          shuffle_seed + step))
         else:
             stage_loader = loader
 
@@ -391,6 +401,21 @@ def train(
             if not torch.isfinite(grad_norm):
                 optimizer.zero_grad(set_to_none=True)
                 skipped += 1
+                continue
+            # clip_grad_norm_ returns the PRE-clip norm; the stored .grad is
+            # already clipped to max_norm=1.0 above regardless. A large-but-
+            # finite pre-clip norm still means this step's gradient direction
+            # is coming from a batch the model is confidently wrong about --
+            # skip the update entirely rather than take even a clipped step
+            # from it. See max_grad_norm_skip in config.yaml for why.
+            max_grad_norm_skip = tcfg.get("max_grad_norm_skip")
+            if max_grad_norm_skip is not None and float(grad_norm) > max_grad_norm_skip:
+                optimizer.zero_grad(set_to_none=True)
+                skipped += 1
+                if skipped <= 10 or skipped % 100 == 0:
+                    print(f"  step {step}: gnorm {float(grad_norm):.2f} > "
+                          f"{max_grad_norm_skip}, skipping ({skipped} skipped so far)",
+                          flush=True)
                 continue
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)

@@ -47,9 +47,14 @@ def check_parity(model_path: Path | None, export_dir: Path, ref_audio_path: Path
     report: dict = {"tolerance": tolerance, "graphs": {}}
 
     # ---- encoder ----
+    # Must pass a real attention_mask: with None the encoder skips its per-layer
+    # sliding windows, and since the exported graph used to do the same, parity
+    # compared two identically-degenerate graphs and passed. See EncoderWrapper.
+    audio_t = torch.from_numpy(audio)[None]
+    enc_mask = torch.ones_like(audio_t, dtype=torch.long)
     with torch.no_grad():
-        enc_pt = model.model.encoder(input_values=torch.from_numpy(audio)[None],
-                                     attention_mask=None).last_hidden_state.numpy()
+        enc_pt = model.model.encoder(input_values=audio_t,
+                                     attention_mask=enc_mask).last_hidden_state.numpy()
     sess = _ort_session(export_dir / "encoder.onnx")
     enc_onx = sess.run(None, {"input_values": audio[None].astype(np.float32)})[0]
     diff = float(np.abs(enc_pt - enc_onx).max())
@@ -104,8 +109,8 @@ def check_parity(model_path: Path | None, export_dir: Path, ref_audio_path: Path
 
     # reimplementation vs HF forward (teacher-forced)
     with torch.no_grad():
-        hf = model(input_values=torch.from_numpy(audio)[None],
-                   attention_mask=None, decoder_input_ids=prefix).logits.numpy()
+        hf = model(input_values=audio_t,
+                   attention_mask=enc_mask, decoder_input_ids=prefix).logits.numpy()
     hf_diff = float(np.abs(hf - pt_logits).max())
     report["reimpl_vs_hf_logits"] = {
         "max_abs_diff": hf_diff,

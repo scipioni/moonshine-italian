@@ -57,6 +57,13 @@ def load_audio(path: Path, sr: int = 16000) -> np.ndarray:
     return data
 
 
+# Per-hop generation floor/ceiling for the streaming decode. _MIN_NEW is the
+# smallest number of tokens a hop may emit; the token budget is clamped to it so
+# the hallucination guard stays satisfiable on short leading chunks.
+_MIN_NEW = 4
+_MAX_NEW_PER_HOP = 32
+
+
 def transcribe_full(model, proc, audio: np.ndarray, max_tokens_per_s: float,
                     sr: int = 16000) -> str:
     import torch
@@ -120,39 +127,58 @@ def transcribe_streaming(
     import torch
 
     hop = int(sr * hop_ms / 1000)
+    eos_id = proc.tokenizer.eos_token_id
     prefix = [proc.tokenizer.bos_token_id]
     latencies: list[float] = []
     compute_s = 0.0
 
-    for end in range(hop, len(audio) + 1, hop):
+    # range() stops at the last whole hop, which drops up to hop_ms of trailing
+    # audio; append the true end so the final partial chunk is still decoded.
+    ends = list(range(hop, len(audio) + 1, hop))
+    if not ends or ends[-1] < len(audio):
+        ends.append(len(audio))
+
+    for end in ends:
         chunk = audio[:end]
         inputs = proc(audio=[chunk], return_tensors="pt", sampling_rate=sr)
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
         inputs["input_values"] = inputs["input_values"].to(
             next(model.parameters()).dtype)
         dur = len(chunk) / sr
-        token_budget = int(dur * max_tokens_per_s)
+        # generate() below always emits at least _MIN_NEW tokens, so a budget
+        # under that floor can never be satisfied. Without this clamp the guard
+        # fires on hop 1 (at hop_ms=100: int(0.1 * 13.0) == 1 < 4) on every
+        # utterance, ending the decode after ~100 ms of audio.
+        token_budget = max(_MIN_NEW, int(dur * max_tokens_per_s))
 
         t0 = time.perf_counter()
         if speculative and len(prefix) > 1:
             prefix, _changed = _verify_prefix(model, inputs, prefix)
-        remaining = max(4, token_budget - len(prefix) + 1)
+        remaining = max(_MIN_NEW, token_budget - len(prefix) + 1)
         with torch.no_grad():
             ids = model.generate(
                 input_values=inputs["input_values"],
                 attention_mask=inputs.get("attention_mask"),
                 decoder_input_ids=torch.tensor([prefix], device=model.device),
-                max_new_tokens=min(remaining, 32),
+                max_new_tokens=min(remaining, _MAX_NEW_PER_HOP),
                 do_sample=False,
             )[0].tolist()
         latencies.append(time.perf_counter() - t0)
         compute_s += latencies[-1]
 
+        # Strip a generated EOS before the prefix is fed back as
+        # decoder_input_ids: an EOS emitted against partial audio only means
+        # "done with what I've heard so far", and leaving it inside the prefix
+        # makes every later hop decode past end-of-sequence.
+        if eos_id is not None and eos_id in ids[1:]:
+            ids = ids[:ids.index(eos_id, 1)]
         prefix = ids
-        # Hallucination guard: token rate too high -> truncate and freeze.
+        # Hallucination guard: token rate too high -> clamp this hop back to
+        # budget and carry on. This used to break out of the loop, which froze
+        # the transcript at the first over-budget hop and turned the rest of the
+        # utterance into deletions (measured 88% deletions on the smoke slice).
         if len(prefix) - 1 > token_budget:
             prefix = [prefix[0]] + prefix[1: token_budget + 1]
-            break
 
     text = proc.tokenizer.decode(prefix, skip_special_tokens=True)
     stats = {

@@ -9,8 +9,9 @@ Graphs (mirror the upstream runtime roles; frontend merged into encoder):
 
 Parity is checked per graph against the PyTorch model (tolerance from
 config.yaml export.onnx.tolerance). Batch 1, no padding: matches the
-single-clip PyTorch eval path (encoder runs unmasked, as in HF code when
-attention_mask is None).
+single-clip PyTorch eval path. The encoder runs *masked* — it must be given an
+attention_mask or it skips its per-layer sliding windows entirely; see
+EncoderWrapper.
 """
 
 from __future__ import annotations
@@ -84,12 +85,24 @@ def _apply_rope(q, k, cos, sin):
 
 
 class EncoderWrapper(torch.nn.Module):
+    """Encoder graph. Keeps the single-input contract the .ort runtime expects.
+
+    The all-ones padding mask is built here rather than taken as a second graph
+    input: the encoder applies its per-layer sliding windows only when
+    attention_mask is not None (see MoonshineStreamingEncoder.forward), so
+    passing None makes all 10 layers attend globally and silently produces a
+    different encoder output (measured 7.57 max-abs drift, decoder then never
+    emits EOS). Batch 1, no padding, so an all-ones mask is exact.
+    """
+
     def __init__(self, model):
         super().__init__()
         self.encoder = model.model.encoder
 
     def forward(self, input_values):
-        return self.encoder(input_values=input_values, attention_mask=None).last_hidden_state
+        mask = torch.ones_like(input_values, dtype=torch.long)
+        return self.encoder(input_values=input_values,
+                            attention_mask=mask).last_hidden_state
 
 
 class AdapterWrapper(torch.nn.Module):
@@ -316,13 +329,18 @@ def export_all(model_path: Path | None, out_dir: Path, opset: int) -> dict:
     written: dict[str, Path] = {}
 
     # --- encoder ---
+    # prefer_dynamo: the encoder now builds its own attention_mask (see
+    # EncoderWrapper), and the legacy TorchScript exporter constant-folds that
+    # mask chain into fixed-size constants, freezing audio_len at the trace
+    # length. torch.export keeps it symbolic.
     wrapper = EncoderWrapper(model).eval()
     path = out_dir / "encoder.onnx"
     _torch_export(
         wrapper, (torch.zeros(1, 16000, dtype=torch.float32),), path, opset,
         ["input_values"], ["enc_hidden"],
         {"input_values": {1: "audio_len"}, "enc_hidden": {1: "frames"}},
-        ({0: "audio_len"},),
+        ({1: "audio_len"},),  # dim 1 is audio length; dim 0 is batch
+        prefer_dynamo=True,
     )
     written["encoder"] = path
 

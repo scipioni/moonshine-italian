@@ -112,7 +112,19 @@ tasks:
       - sh: test -f {{.SMOKE_MANIFEST}}
         msg: "smoke manifest missing — run: task slice-smoke"
     cmds:
+      - task: checkpoint-banner
       - '{{.PY}} -m moonshine_it.evaluate_cli --model {{.CHECKPOINT}} --mode both --name {{.TRAIN_PROFILE}} --gate {{.GATE}}'
+
+  checkpoint-banner:
+    internal: true
+    # TRAIN_PROFILE defaults to smoke, so a bare `task export PROFILE=...` after
+    # a final run silently ships the 60-step smoke checkpoint. Name the source
+    # and its step count so that is impossible to miss.
+    cmds:
+      - |
+        step=$(sed -n 's/.*"global_step": *\([0-9]*\).*/\1/p' \
+                 {{.CHECKPOINT}}/trainer_state.json 2>/dev/null | head -1)
+        echo "==> TRAIN_PROFILE={{.TRAIN_PROFILE}}  checkpoint={{.CHECKPOINT}} (trained to step ${step:-unknown})"
 
   export:
     desc: PyTorch -> ONNX graphs (gate-checked; parity verified)
@@ -123,6 +135,7 @@ tasks:
       - sh: test -f results/gates/{{.GATE}}.json
         msg: "gate record missing — run: task eval GATE={{.GATE}}"
     cmds:
+      - task: checkpoint-banner
       - '{{.PY}} -m moonshine_it.export --model {{.CHECKPOINT}} --gate {{.GATE}}'
       - '{{.PY}} -m moonshine_it.parity --model {{.CHECKPOINT}}'
 

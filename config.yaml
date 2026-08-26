@@ -123,6 +123,10 @@ training:
 
 evaluation:
   full_utterance: true
+  # Sample count for the in-training eval hook. Was hard-coded to 8, which is
+  # ~100 reference words -- a 1-WER-point granularity, far too coarse to steer
+  # a 40k-step run and not comparable to the gate numbers.
+  in_loop_samples: 64
   streaming:
     enabled: true
     hop_ms: 100              # allowed range 32..100

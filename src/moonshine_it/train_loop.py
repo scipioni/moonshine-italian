@@ -160,12 +160,13 @@ def find_latest_checkpoint(out_dir: Path) -> Path | None:
 
 
 def quick_eval_wer(model, proc, manifest: Path, audio_root: Path, cfg: dict,
-                   limit: int = 8) -> float:
+                   limit: int | None = None) -> float:
     import jiwer
 
-    from moonshine_it.evaluate import (evaluate_manifest,
-                                       transcribe_full)
+    from moonshine_it.evaluate import transcribe_full
 
+    if limit is None:
+        limit = cfg["evaluation"].get("in_loop_samples", 64)
     rows = [json.loads(l) for l in manifest.read_text().splitlines()][:limit]
     max_tps = cfg["evaluation"]["streaming"]["max_tokens_per_second"]
     refs, hyps = [], []
@@ -242,16 +243,10 @@ def train(
     )
 
     tcfg = cfg["training"]
-    optimizer = ScheduleFreeAdamW(
-        model.parameters(),
-        lr=tcfg["learning_rate"],
-        betas=tuple(tcfg["betas"]),
-        weight_decay=tcfg["weight_decay"],
-        warmup_steps=tcfg["warmup_steps"],
-    )
 
     start_step = 0
     latest = find_latest_checkpoint(out_dir)
+    opt_state_path = None
     if resume and latest is not None:
         state = json.loads((latest / "trainer_state.json").read_text())
         start_step = state["global_step"]
@@ -262,11 +257,32 @@ def train(
             dtype={"bf16": torch.bfloat16, "fp32": torch.float32}[rp.precision],
         ).to(rp.device)
         model.train()
-        import torch as _t
+        opt_state_path = latest / "optimizer.pt"
 
-        optimizer.load_state_dict(_t.load(latest / "optimizer.pt",
-                                          map_location=rp.device, weights_only=False))
+    # The optimizer MUST be built after the resume reload. Building it first
+    # binds it to the pre-reload parameter tensors, which from_pretrained then
+    # discards -- optimizer.step() silently becomes a no-op (it iterates params
+    # whose .grad is None) while loss.backward() writes grads to the new module.
+    # Symptom when this regresses: flat loss, byte-identical checkpoints, and a
+    # frozen eval metric, with no error anywhere.
+    optimizer = ScheduleFreeAdamW(
+        model.parameters(),
+        lr=tcfg["learning_rate"],
+        betas=tuple(tcfg["betas"]),
+        weight_decay=tcfg["weight_decay"],
+        warmup_steps=tcfg["warmup_steps"],
+    )
+    if opt_state_path is not None:
+        optimizer.load_state_dict(torch.load(opt_state_path,
+                                             map_location=rp.device,
+                                             weights_only=False))
         print(f"resume: from step {start_step} ({latest.name})")
+
+    owned = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    if owned != {id(p) for p in model.parameters()}:
+        raise RuntimeError(
+            "optimizer is not bound to the model's parameters — optimizer.step() "
+            "would be a no-op and training would silently do nothing")
 
     max_steps = dry_run_steps if dry_run_steps is not None else rp.max_steps
     writer = SummaryWriter(log_dir=str(out_dir / "runs"))

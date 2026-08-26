@@ -33,10 +33,30 @@ from moonshine_it.normalize_it import _int_to_italian, expand_numbers, normalize
         (34000, "trentaquattromila"),
         (100000, "centomila"),
         (250000, "duecentocinquantamila"),
+        # >= 1e6 used to raise IndexError: _under_thousand was called
+        # directly on the unscaled thousands group (n // 1000), which can
+        # exceed the 0-999 range _HUNDREDS supports. Surfaced by Common
+        # Voice sentences (Wikipedia-sourced, so contain real large numbers)
+        # -- MLS/FLEURS text never happened to hit this range.
+        (1000000, "un milione"),
+        (2000000, "due milioni"),
+        (1234567, "un milione duecentotrentaquattromilacinquecentosessantasette"),
+        (21000000, "ventuno milioni"),
+        (1000000000, "un miliardo"),
+        (1234567890,
+         "un miliardo duecentotrentaquattro milioni "
+         "cinquecentosessantasettemilaottocentonovanta"),
     ],
 )
 def test_int_to_italian(n, expected):
     assert _int_to_italian(n) == expected
+
+
+def test_large_numbers_never_crash():
+    # No IndexError regardless of magnitude, not just at the specific
+    # boundary values above.
+    for n in (999999, 1000000, 999999999, 1000000000, 10**15, 10**18):
+        _int_to_italian(n)
 
 
 def test_decimal_number():

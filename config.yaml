@@ -61,13 +61,22 @@ datasets:
         validation: "italian/dev-*.parquet"
         test: "italian/test-*.parquet"
   common_voice:
-    repo: "mozilla-foundation/common_voice_21_0"
+    repo: "mozilla-foundation/common_voice_21_0"   # kept for reference; unreachable, see note
     config: "it"
-    enabled: false
-    gated: true
-    # unavailable: all mozilla-foundation/common_voice_* dataset repos were
-    # removed from the HF hub (404); 17_0 survives as an empty README shell.
-    # Optional mix-in per design D4 — training proceeds MLS-only.
+    enabled: true
+    gated: false
+    local:
+      # mozilla-foundation/common_voice_* on HF returns 404 (repo removed).
+      # Sourced instead as a local CC0 archive from mozilladatacollective.com;
+      # path comes from CV_ARCHIVE_PATH in .env (see .env.example). download.py
+      # extracts only the clips referenced by train/dev/test.tsv into
+      # data/raw/common_voice_it/.
+      archive_env: "CV_ARCHIVE_PATH"
+      inner_prefix: "cv-corpus-26.0-2026-06-12/it"
+      splits: { train: "train.tsv", validation: "dev.tsv", test: "test.tsv" }
+    note: >
+      CC0-licensed. train.tsv/dev.tsv/test.tsv are Common Voice's own
+      speaker-balanced, validated splits — no extra vote filtering applied.
 
 preparation:
   target_sr: 16000
@@ -112,9 +121,28 @@ training:
       gate: "smoke"
     final:
       output_dir: "results/train-final"
-      max_steps: 40000
+      # 2 epochs over the mls+common_voice+fleurs mix: 285,401 train rows /
+      # batch 8 (rocm12g) = 35,675 steps/epoch (drop_last) -> 71,350 for 2
+      # epochs, rounded to 72000. At the measured 1.7337 steps/s (from a
+      # prior run's run_metadata.json -- forward/backward/optimizer.step all
+      # ran every step even before the resume-optimizer-binding fix, so the
+      # per-step cost is representative) that's ~11.5h wall time. Was 40000
+      # (~2.9 epochs) when training was mls-only (110,004 rows); the curriculum
+      # below needs no change -- stage_for_step() holds at its last entry
+      # (max_audio_s: 30.0, uncapped) for any step past its 40000-step sum.
+      max_steps: 72000
       eval_steps: 1000
       save_steps: 1000
+      # Training manifests to concatenate (data/prepared/<name>/train.jsonl).
+      # mls is 216.7h of 19th-century audiobook narration from a handful of
+      # narrators; common_voice adds 205.9h from 7,342 speakers (CC0,
+      # crowd-read; measured post-VAD-trim -- raw clip_durations.tsv sums to
+      # 255.8h before silence/no-speech trimming); fleurs adds 4.35h in the
+      # eval domain itself (modern news, same register as the FLEURS-it test
+      # set the release gates measure against). In-loop eval stays on
+      # mls/validation.jsonl regardless of this list, so the eval/wer curve
+      # stays comparable step-to-step as the mix changes.
+      datasets: ["mls", "common_voice", "fleurs"]
       curriculum:
         - { steps: 8000, max_audio_s: 5.0, description: "short clips" }
         - { steps: 16000, max_audio_s: 10.0, description: "medium clips" }

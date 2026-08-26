@@ -12,7 +12,7 @@ end-to-end on a small smoke slice before any multi-day run.
 ```bash
 # prerequisites: Arch + GPU packages + uv (see docs/environment.md)
 uv venv --system-site-packages && uv sync
-cp .env.example .env          # set HF_TOKEN only if using Common Voice
+cp .env.example .env          # set CV_ARCHIVE_PATH if using Common Voice (see docs/data.md)
 
 task smoke PROFILE=rocm12g    # download → spike → train → eval → export → ort → validate
 ```

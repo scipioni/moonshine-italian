@@ -41,9 +41,16 @@ uv run python -c "import torch; print(torch.cuda.is_available())"
 
 ## 3. Secrets
 
-Common Voice Italian is gated. Copy `.env.example` to `.env` and set
-`HF_TOKEN` (https://huggingface.co/settings/tokens) after accepting the
-dataset terms. FLEURS and MLS need no token.
+Copy `.env.example` to `.env` and fill in:
+
+- `HF_TOKEN` (https://huggingface.co/settings/tokens) — only needed if you
+  hit a genuinely gated HF dataset; FLEURS and MLS are public.
+- `CV_ARCHIVE_PATH` — path to a locally-downloaded Common Voice Italian
+  archive (`mozilla-foundation/common_voice_*` is 404 on HF). Download it
+  from
+  [mozilladatacollective.com](https://mozilladatacollective.com/datasets/cmqini14100vmnq07309ocknr),
+  save it anywhere (e.g. `/tmp`), and point `CV_ARCHIVE_PATH` at it. See
+  `docs/data.md` for the full download/extract flow.
 
 ## 4. Hardware profiles
 

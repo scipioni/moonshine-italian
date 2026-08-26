@@ -328,10 +328,53 @@ def merge_parts(out_dir: Path, split_name: str, num_shards: int) -> bool:
     return True
 
 
+class _CommonVoiceSplit:
+    """Iterable over one Common Voice split, reading clip bytes from the
+    local extraction directory (see download.download_common_voice_local).
+    Yields the same {"audio": {"bytes": ...}, "transcription": ...} shape
+    prepare_split() expects from an HF dataset split."""
+
+    def __init__(self, tsv_path: Path, clips_dir: Path):
+        self.tsv_path = tsv_path
+        self.clips_dir = clips_dir
+
+    def __iter__(self):
+        import csv
+
+        with open(self.tsv_path, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                clip_path = self.clips_dir / row["path"]
+                if not clip_path.exists():
+                    continue  # upstream-invalidated/removed clip
+                yield {
+                    "audio": {"bytes": clip_path.read_bytes()},
+                    "transcription": row["sentence"],
+                }
+
+
+def _iter_common_voice_local(cfg: dict, ds_cfg: dict) -> dict:
+    from moonshine_it.download import cv_extract_dir
+
+    extract_dir = cv_extract_dir(cfg)
+    clips_dir = extract_dir / "clips"
+    if not clips_dir.exists():
+        raise SystemExit(
+            "Common Voice clips not found — run: "
+            "task download-data DATASET=common_voice"
+        )
+    return {
+        split: _CommonVoiceSplit(extract_dir / tsv_name, clips_dir)
+        for split, tsv_name in ds_cfg["local"]["splits"].items()
+    }
+
+
 def iter_dataset(name: str, cfg: dict):
+    ds_cfg = cfg["datasets"][name]
+    if ds_cfg.get("local"):
+        return _iter_common_voice_local(cfg, ds_cfg)
+
     from datasets import Audio, load_dataset
 
-    ds_cfg = cfg["datasets"][name]
     repo, config = ds_cfg["repo"], ds_cfg["config"]
     from moonshine_it.config import hf_token
 

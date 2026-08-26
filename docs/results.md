@@ -108,9 +108,17 @@ design's open question (MLS-it usable hours after segmentation+filtering):
 "unsplittable" was a text-splitter bug on single-sentence audiobook prose,
 fixed with proportional word-boundary fallback).
 
-Common Voice mix-in: **unavailable** — all `mozilla-foundation/common_voice_*`
+Common Voice mix-in: **unavailable via HF** — all `mozilla-foundation/common_voice_*`
 dataset repos were removed from the HF hub (404; 17_0 survives as an empty
-README shell). Training proceeds MLS-only per design D4 (CV was optional).
+README shell). Training proceeded MLS-only per design D4 (CV was optional)
+through the runs recorded below.
+
+**Update (2026-08-26):** Common Voice it is now sourced from a local
+CC0-licensed archive (mozilladatacollective.com) instead of HF — see
+`docs/data.md`. 173,174 train-split clips prepared (~205.9 h post-VAD-trim
+from a raw 255.8 h / 7,342 speakers). `training.profiles.final.datasets` is
+`["mls", "common_voice", "fleurs"]` going forward; the MLS-only numbers above
+predate this and are not comparable to any run after this date.
 
 ### Final training (task 10.2)
 

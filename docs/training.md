@@ -66,6 +66,13 @@ chunked-augmentation regularizer, eval + checkpoints every 1000 steps to
 `results/train-final/`. The best checkpoint (eval WER) is promoted as
 `checkpoint-best`.
 
+Trains on the manifests concatenated in `training.profiles.final.datasets`
+(currently `mls` + `common_voice` + `fleurs`, see `docs/data.md` for
+preparing each) — `max_steps` (currently 72000, ~2 epochs over the combined
+set) should be re-derived if that list or any individual manifest's row
+count changes: `steps_per_epoch = total_train_rows // batch_size` for the
+target hardware profile.
+
 ## Method notes
 
 Adapted from the community `finetune-moonshine-asr` methods (HF

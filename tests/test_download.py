@@ -11,10 +11,11 @@ def test_unknown_dataset_rejected():
         download_data(load_cfg(), "voxpopuli")
 
 
-def test_common_voice_requires_token(monkeypatch, tmp_path):
-    monkeypatch.setattr(dl, "hf_token", lambda: None)
+def test_common_voice_requires_archive_env(monkeypatch):
+    # common_voice is sourced from a local CC0 archive (HF's copy is 404), so
+    # the failure mode is a missing CV_ARCHIVE_PATH, not a missing HF_TOKEN.
+    monkeypatch.setattr(dl, "env_var", lambda name: None)
     cfg = load_cfg()
-    cfg["datasets"]["common_voice"]["enabled"] = True
     with pytest.raises(SystemExit, match=r"\.env\.example"):
         download_data(cfg, "common_voice")
 

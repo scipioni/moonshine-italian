@@ -52,11 +52,27 @@ def _under_thousand(n: int) -> str:
     return hundreds + _under_thousand(rest)
 
 
+_SCALES = [(10**12, "bilione", "bilioni"),
+           (10**9, "miliardo", "miliardi"),
+           (10**6, "milione", "milioni")]
+
+
 def _int_to_italian(n: int) -> str:
     if n < 0:
         return "meno " + _int_to_italian(-n)
     if n < 1000:
         return _under_thousand(n)
+    # milioni/miliardi/bilioni are separate words (space-joined, "un milione"
+    # not "unmilione"), unlike mila which concatenates onto the next word.
+    # _under_thousand is only valid under 1000, so anything >= 1e6 must be
+    # scaled down here first -- calling it directly on an unscaled thousands
+    # group (e.g. n=1_000_000 -> thousands=1000) is what used to crash with
+    # IndexError on _HUNDREDS.
+    for value, singular, plural in _SCALES:
+        if n >= value:
+            count, rest = divmod(n, value)
+            head = "un " + singular if count == 1 else _int_to_italian(count) + " " + plural
+            return head if rest == 0 else head + " " + _int_to_italian(rest)
     thousands, rest = divmod(n, 1000)
     if thousands == 1:
         head = "mille"

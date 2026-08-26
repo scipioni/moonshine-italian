@@ -131,6 +131,7 @@ class ResolvedProfile:
     save_steps: int
     curriculum: list[dict[str, Any]]
     gate: str
+    datasets: list[str]
 
     def run_metadata(self) -> dict[str, Any]:
         return {
@@ -181,6 +182,11 @@ def resolve_profile(
         save_steps=tp["save_steps"],
         curriculum=list(tp.get("curriculum") or []),
         gate=tp["gate"],
+        # Training manifests to concatenate: data/prepared/<name>/train.jsonl
+        # for each name. Defaults to the original mls-only behavior for any
+        # profile (e.g. smoke) that doesn't declare it -- smoke's own loading
+        # path in train_loop.py ignores this and uses its fixed slice_manifest.
+        datasets=list(tp.get("datasets") or ["mls"]),
     )
 
 
@@ -192,3 +198,8 @@ def hf_token() -> str | None:
     env = {k: v for k, v in os.environ.items() if k == "HF_TOKEN"}
     token = env.get("HF_TOKEN") or load_env().get("HF_TOKEN")
     return token or None
+
+
+def env_var(name: str) -> str | None:
+    """Read a private value from the environment, then .env (see hf_token)."""
+    return os.environ.get(name) or load_env().get(name) or None

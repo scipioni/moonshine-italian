@@ -71,6 +71,37 @@ class ASRDataset:
         return {"audio": audio, "text": text}
 
 
+class MultiASRDataset:
+    """Concatenates several ASRDataset instances (each its own manifest +
+    audio_root) into one flat, shuffleable dataset.
+
+    Keeps a flat `.rows` list mirroring ASRDataset's, so curriculum staging
+    (which filters `dataset.rows` by duration_s to build a Subset) works
+    unchanged whether training on one dataset or several.
+    """
+
+    def __init__(self, datasets: list[ASRDataset]):
+        if not datasets:
+            raise ValueError("MultiASRDataset needs at least one dataset")
+        self.datasets = datasets
+        self.rows = [r for d in datasets for r in d.rows]
+        self._offsets = []
+        total = 0
+        for d in datasets:
+            self._offsets.append(total)
+            total += len(d)
+        self._len = total
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, i: int):
+        import bisect
+
+        di = bisect.bisect_right(self._offsets, i) - 1
+        return self.datasets[di][i - self._offsets[di]]
+
+
 class Collator:
     def __init__(self, proc):
         self.proc = proc
@@ -219,17 +250,31 @@ def train(
         audio_root = smoke_root / "audio"
         val_manifest = smoke_root / "test.jsonl"
         val_audio = smoke_root / "audio"
+        if not manifest.exists():
+            raise SystemExit(f"training manifest missing: {manifest} — run prepare first")
+        dataset = ASRDataset(manifest, audio_root, cfg, augment=True,
+                             seed=cfg["smoke"]["seed"])
     else:
-        data_root = REPO_ROOT / cfg["paths"]["data"] / "prepared" / "mls"
-        manifest = data_root / "train.jsonl"
-        audio_root = data_root
-        val_manifest = data_root / "validation.jsonl"
-        val_audio = data_root
-    if not manifest.exists():
-        raise SystemExit(f"training manifest missing: {manifest} — run prepare first")
+        # In-loop eval intentionally stays on mls/validation.jsonl regardless
+        # of rp.datasets, so eval/wer is comparable across runs even as the
+        # training mix changes.
+        val_root = REPO_ROOT / cfg["paths"]["data"] / "prepared" / "mls"
+        val_manifest = val_root / "validation.jsonl"
+        val_audio = val_root
 
-    dataset = ASRDataset(manifest, audio_root, cfg, augment=True,
-                         seed=cfg["smoke"]["seed"])
+        parts = []
+        for name in rp.datasets:
+            data_root = REPO_ROOT / cfg["paths"]["data"] / "prepared" / name
+            data_manifest = data_root / "train.jsonl"
+            if not data_manifest.exists():
+                raise SystemExit(
+                    f"training manifest missing: {data_manifest} — run: "
+                    f"task prepare DATASET={name}")
+            parts.append(ASRDataset(data_manifest, data_root, cfg, augment=True,
+                                    seed=cfg["smoke"]["seed"]))
+            print(f"train[{training_profile}]: +{name} "
+                  f"({len(parts[-1])} rows, {data_manifest})")
+        dataset = parts[0] if len(parts) == 1 else MultiASRDataset(parts)
     loader = DataLoader(
         dataset,
         batch_size=rp.batch_size,

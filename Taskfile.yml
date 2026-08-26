@@ -45,18 +45,32 @@ tasks:
       - '{{.PY}} -m moonshine_it.download model'
 
   download-data:
-    desc: Fetch datasets (fleurs | mls | common_voice)
+    desc: >
+      Fetch datasets (fleurs | mls | common_voice). common_voice is a local
+      CC0 archive, not an HF repo -- set CV_ARCHIVE_PATH in .env first (see
+      docs/data.md); pass -- --force to re-extract after a fresh download.
     cmds:
-      - '{{.PY}} -m moonshine_it.download data {{.DATASET}}'
+      # {{.CLI_ARGS}}: go-task does NOT auto-append trailing `task x -- y`
+      # args to cmds -- without this interpolation `-- --force` is silently
+      # dropped and download_data() never sees it.
+      - '{{.PY}} -m moonshine_it.download data {{.DATASET}} {{.CLI_ARGS}}'
 
   prepare:
-    desc: Prepare a dataset (16 kHz mono, VAD segmentation, manifests)
+    desc: >
+      Prepare a dataset (16 kHz mono, VAD segmentation, manifests).
+      common_voice is ~200k clips -- expect several hours on CPU VAD.
+      Pass -- --force to re-segment even if manifests exist.
     deps: [profile-check]
     preconditions:
-      - sh: test -d data/hf-cache
+      - sh: |
+          case "{{.DATASET}}" in
+            common_voice) test -d data/raw/common_voice_it/clips ;;
+            *) test -d data/hf-cache ;;
+          esac
         msg: "dataset cache missing — run: task download-data DATASET={{.DATASET}}"
     cmds:
-      - '{{.PY}} -m moonshine_it.prepare --dataset {{.DATASET}}'
+      # see the {{.CLI_ARGS}} note in download-data above.
+      - '{{.PY}} -m moonshine_it.prepare --dataset {{.DATASET}} {{.CLI_ARGS}}'
 
   slice-smoke:
     desc: Deterministic smoke slice from prepared FLEURS-it

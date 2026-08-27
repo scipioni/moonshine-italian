@@ -856,8 +856,14 @@ def train(
                       flush=True)
             if step % save_steps == 0:
                 torch.cuda.synchronize()  # scoped: settle the step before saving
-                metrics = locals().get("metrics", {}) or {}
-                save_checkpoint(model, proc, optimizer, out_dir, step, metrics)
+                # Saves are more frequent than evals, so most checkpoints have
+                # no metric of their own. Hand them an empty one rather than
+                # the previous eval's: trainer_state.json is the record of
+                # what a checkpoint scored, and copying a neighbour's number
+                # into it is how a metric stops describing its artifact.
+                m = locals().get("metrics", {}) or {}
+                save_checkpoint(model, proc, optimizer, out_dir, step,
+                                m if m.get("global_step") == step else {})
                 prune_checkpoints(out_dir, rp.keep_last_checkpoints,
                                   protected=protected_checkpoints)
         epoch += 1

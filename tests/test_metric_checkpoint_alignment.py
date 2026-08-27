@@ -86,3 +86,17 @@ class _Opt:
 
     def state_dict(self):
         return {}
+
+
+def test_intermediate_save_records_no_borrowed_metric(tmp_path):
+    """Saves outrun evals 4:1; the in-between checkpoints must not inherit
+    the previous eval's WER as if it were their own."""
+    import moonshine_it.train_loop as tl
+
+    tl.save_checkpoint(_Model(tmp_path), _Model(tmp_path), _Opt(),
+                       tmp_path, 9500, {})
+
+    state = json.loads((tmp_path / "checkpoint-9500" /
+                        "trainer_state.json").read_text())
+    assert state["metrics"] == {}
+    assert not (tmp_path / "best_metric.json").exists()

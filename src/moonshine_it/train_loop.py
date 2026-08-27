@@ -248,6 +248,22 @@ def stage_for_step(curriculum: list[dict], step: int) -> dict | None:
     return curriculum[-1] if curriculum else None
 
 
+def stage_index_for_step(curriculum: list[dict], step: int) -> int | None:
+    """Index of the stage stage_for_step would return, or None with no
+    curriculum. Used to detect a stage boundary: crossing one deliberately
+    changes the training distribution, so metrics either side of it are not
+    a continuous series.
+    """
+    if not curriculum:
+        return None
+    cumulative = 0
+    for i, stage in enumerate(curriculum):
+        cumulative += stage["steps"]
+        if step < cumulative:
+            return i
+    return len(curriculum) - 1
+
+
 def validate_curriculum(curriculum: list[dict], rows: list[dict]) -> list[dict]:
     """Validate curriculum stages against the prepared corpus (training-pipeline
     spec: "Curriculum stages must be effective against the prepared corpus").
@@ -732,7 +748,25 @@ def train(
 
     step = start_step
     epoch = 0
-    regression_streak = 0
+    # The regression streak must outlive the process. It used to be a local
+    # initialized to 0 here, which on rocm12g made the latch a no-op: the
+    # amdgpu fault restarts the run every few minutes, resetting the counter
+    # long before it could reach REGRESSION_STREAK_THRESHOLD. Measured on
+    # this run -- evals at 8000, 9000 and 10000 were all worse than baseline
+    # (three in a row, which should have halted it) but landed in attempts
+    # 11, 12 and 12, so the streak never exceeded 2.
+    state_path = out_dir / "run_state.json"
+    run_state = (json.loads(state_path.read_text())
+                 if resume and state_path.exists() else {})
+    regression_streak = run_state.get("regression_streak", 0)
+    last_stage_index = run_state.get("stage_index")
+    if regression_streak:
+        print(f"  regression streak carried over: {regression_streak}")
+
+    def persist_run_state(streak: int, stage_index: int | None) -> None:
+        state_path.write_text(json.dumps(
+            {"regression_streak": streak, "stage_index": stage_index}, indent=2))
+
     t_start = time.time()
     while step < max_steps:
         # curriculum: rebuild dataset view for the current stage
@@ -847,8 +881,24 @@ def train(
                 # can verify the metric is its own (see save_checkpoint).
                 metrics["global_step"] = step
                 wer = metrics["eval_wer"]
+                # A curriculum boundary deliberately changes the training
+                # distribution, so evals either side of it are not one
+                # series. Measured across the stage 1->2 boundary at step
+                # 8000 (<=5s clips -> the full <=10s corpus): 82.15% at 7000,
+                # then 93.94% and 96.0%, recovering to 86.16% by 10000. The
+                # latch exists to catch a run persistently worse than its
+                # origin, not this transient, so the streak restarts here.
+                stage_index = stage_index_for_step(rp.curriculum, step)
+                if stage_index != last_stage_index:
+                    if last_stage_index is not None and regression_streak:
+                        print(f"  curriculum stage {last_stage_index} -> "
+                              f"{stage_index}: regression streak reset "
+                              f"(was {regression_streak})")
+                    regression_streak = 0
+                    last_stage_index = stage_index
                 regression_streak = check_iterate_not_regressed(
                     wer, baseline_wer, iterate="y", streak=regression_streak)
+                persist_run_state(regression_streak, stage_index)
                 writer.add_scalar("eval/wer", wer, step)
                 record_eval(out_dir, step, metrics)
                 print(f"  step {step} eval WER {wer:.1f}% "

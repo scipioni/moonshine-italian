@@ -53,7 +53,7 @@ hardware_profiles:
   cuda:
     device: "cuda"
     accelerator_kind: "cuda"
-    batch_size: 16
+    batch_size: 8
     precision: "bf16"
     num_workers: 8
     ort_provider: "CUDAExecutionProvider"

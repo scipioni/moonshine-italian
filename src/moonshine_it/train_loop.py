@@ -675,12 +675,32 @@ def train(
     # Baseline for the sanity latch below (training-pipeline spec: "Averaged
     # iterate is rejected while it is worse than the starting point") -- the
     # model as loaded for this run, before any of its own training steps.
-    model.eval()
-    baseline_wer = quick_eval_wer(model, proc, val_manifest, val_audio, cfg,
-                                  split_name=val_split_name, iterate="y")["eval_wer"]
-    model.train()
-    print(f"  baseline WER at run start (iterate=y, split={val_split_name}): "
-          f"{baseline_wer:.2f}%")
+    # Persisted across supervisor restarts. The latch asks "is the iterate
+    # worse than the starting point it was initialized from" -- re-measuring
+    # it on every crash-resume would let the reference drift upward with the
+    # model, weakening the latch into a no-op, and on rocm12g (where the
+    # amdgpu fault restarts the run every few minutes) it also spent most of
+    # the restart overhead. Measured once per campaign, at its true origin.
+    baseline_path = out_dir / "run_baseline.json"
+    cached = (json.loads(baseline_path.read_text())
+              if resume and latest is not None and baseline_path.exists()
+              else None)
+    if cached and cached.get("eval_split") == val_split_name:
+        baseline_wer = cached["eval_wer"]
+        print(f"  baseline WER (iterate=y, split={val_split_name}): "
+              f"{baseline_wer:.2f}% — reused from step {cached['origin_step']}")
+    else:
+        model.eval()
+        baseline_wer = quick_eval_wer(model, proc, val_manifest, val_audio, cfg,
+                                      split_name=val_split_name,
+                                      iterate="y")["eval_wer"]
+        model.train()
+        baseline_path.write_text(json.dumps(
+            {"eval_wer": baseline_wer, "iterate": "y",
+             "eval_split": val_split_name, "origin_step": start_step,
+             "measured": time.strftime("%Y-%m-%dT%H:%M:%S")}, indent=2))
+        print(f"  baseline WER at run start (iterate=y, split={val_split_name}): "
+              f"{baseline_wer:.2f}%")
 
     # Step budget is expressed independently of gradient accumulation
     # (training-pipeline spec) -- accum_steps is fixed before max_steps/

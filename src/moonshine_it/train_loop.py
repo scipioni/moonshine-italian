@@ -369,6 +369,18 @@ def train(
 
         optimizer.train()
         skipped = 0
+        # Gradient accumulation: batch=8 with no accumulation gave a very
+        # noisy per-step gradient (frequent large gnorm spikes, e.g. 50-200+
+        # against a typical 10-60, needing aggressive clip_grad_norm_ every
+        # step) -- a plausible contributor to a run where loss barely moved
+        # and eval WER got noisier/worse over 72k steps rather than
+        # improving. accum_steps averages the gradient over more samples
+        # before each update, at the cost of accum_steps x wall time per
+        # optimizer step. 1 (default) reproduces the original behavior
+        # exactly.
+        accum_steps = max(1, int(tcfg.get("grad_accum_steps", 1)))
+        micro = 0
+        accum_loss = 0.0
         for batch in stage_loader:
             if step >= max_steps:
                 break
@@ -383,19 +395,30 @@ def train(
                             attention_mask=batch.get("attention_mask"),
                             labels=batch["labels"])
                 loss = out.loss
-            loss.backward()
             # Untuned-on-Italian checkpoints produce huge LayerNorm gradients
             # (confidently-wrong predictions over a 32k vocab; measured
             # ~4e7 pre-clip) which overflow to inf across the deep backward
-            # chain. Clip every step; skip any step whose loss/grads are
-            # already non-finite so bad weights can't poison the run.
+            # chain. Skip any micro-batch whose loss is already non-finite so
+            # bad weights can't poison the run -- this drops the WHOLE
+            # accumulation window (zero_grad clears any finite micro-batches
+            # already summed into it too), simplest safe behavior.
             if not torch.isfinite(loss):
                 optimizer.zero_grad(set_to_none=True)
+                micro = 0
+                accum_loss = 0.0
                 skipped += 1
                 if skipped <= 10 or skipped % 100 == 0:
                     print(f"  step {step}: non-finite loss, skipping "
                           f"({skipped} skipped so far)", flush=True)
                 continue
+            (loss / accum_steps).backward()
+            micro += 1
+            accum_loss += loss.item()
+            if micro < accum_steps:
+                continue
+            mean_loss = accum_loss / accum_steps
+            micro = 0
+            accum_loss = 0.0
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
@@ -420,12 +443,12 @@ def train(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             step += 1
-            writer.add_scalar("train/loss", loss.item(), step)
+            writer.add_scalar("train/loss", mean_loss, step)
             writer.add_scalar("train/grad_norm",
                               float(grad_norm) if torch.is_tensor(grad_norm)
                               else grad_norm, step)
             if step % 10 == 0:
-                print(f"  step {step}/{max_steps} loss {loss.item():.4f} "
+                print(f"  step {step}/{max_steps} loss {mean_loss:.4f} "
                       f"gnorm {float(grad_norm):.2f} "
                       f"({(time.time()-t_start):.0f}s)", flush=True)
 

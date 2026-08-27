@@ -216,6 +216,13 @@ def derive_step_budget(rp, total_samples: int, accum_steps: int, *,
         # cadence because it is the expensive half.
         if rp.max_save_interval_steps is not None:
             save_steps = max(1, min(save_steps, rp.max_save_interval_steps))
+            # Keep every eval step ON a save step. Otherwise the two cadences
+            # interleave (eval at 4995, save at 5000) and the checkpoint gets
+            # ranked by a metric measured on weights five optimizer steps
+            # older -- reintroducing, in miniature, the very defect this
+            # change exists to remove: a recorded number that does not
+            # describe the artifact it is attached to.
+            eval_steps = max(1, round(eval_steps / save_steps)) * save_steps
     else:
         max_steps = dry_run_steps if dry_run_steps is not None else rp.max_steps
         eval_steps, save_steps = rp.eval_steps, rp.save_steps
@@ -368,6 +375,15 @@ def save_checkpoint(model, proc, optimizer, out_dir: Path, step: int,
     marker = out_dir / "best_metric.json"
     prev_best = json.loads(marker.read_text()) if marker.exists() else None
     score = metrics.get("eval_wer")
+    # Rank only on a metric measured on THESE weights. derive_step_budget
+    # aligns the eval cadence onto the save cadence so this always holds; if
+    # that alignment ever regresses, refuse to rank rather than silently
+    # attaching a stale number to a checkpoint.
+    measured_at = metrics.get("global_step")
+    if score is not None and measured_at is not None and measured_at != step:
+        print(f"  checkpoint {step}: not ranked — its metric was measured at "
+              f"step {measured_at}, not {step}", flush=True)
+        score = None
     if score is not None and (prev_best is None or score < prev_best["eval_wer"]):
         # O(1) promotion: point the best-checkpoint at the winning step via a
         # symlink instead of copying the (potentially ~1.6 GB) checkpoint.
@@ -807,6 +823,9 @@ def train(
                 metrics = quick_eval_wer(model, proc, val_manifest, val_audio, cfg,
                                          split_name=val_split_name, iterate="y")
                 model.train()
+                # Stamp the step the measurement describes, so a checkpoint
+                # can verify the metric is its own (see save_checkpoint).
+                metrics["global_step"] = step
                 wer = metrics["eval_wer"]
                 regression_streak = check_iterate_not_regressed(
                     wer, baseline_wer, iterate="y", streak=regression_streak)

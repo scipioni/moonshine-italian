@@ -15,14 +15,16 @@ vars:
 
 env:
   TOKENIZERS_PARALLELISM: 'false'
-  # Curriculum-stage training batches mix widely varying audio lengths
-  # (e.g. ~1-5s within stage 1), and PyTorch's caching allocator can
-  # fragment across enough distinct shapes to OOM well under the card's
-  # actual capacity (observed: "10.94 GiB allocated by PyTorch" out of
-  # 15.92 GiB total, failing an 8.06 GiB request). expandable_segments lets
-  # the allocator grow/shrink segments instead of only ever requesting new
-  # fixed-size blocks -- the standard mitigation for this exact pattern.
-  PYTORCH_CUDA_ALLOC_CONF: 'expandable_segments:True'
+  # Tried PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to address a
+  # fragmentation-looking OOM (10.94 GiB allocated by PyTorch out of 15.92
+  # GiB, failing an 8.06 GiB request) -- reverted: the next two resume
+  # attempts both hit the amdgpu VM page fault (see shuffle_seed in
+  # config.yaml) immediately, before completing even one training step,
+  # instead of after hundreds-to-thousands of steps as usual. Only 2 data
+  # points and the underlying fault is already known to be stochastic in
+  # timing, but expandable_segments is a CUDA allocator feature with
+  # historically incomplete ROCm/HIP support, so it's a plausible enough
+  # cause not to leave enabled without confirming it's actually safe here.
 
 tasks:
   default:

@@ -157,11 +157,30 @@ def save_checkpoint(model, proc, optimizer, out_dir: Path, step: int,
                     metrics: dict) -> Path:
     ckpt = out_dir / f"checkpoint-{step}"
     ckpt.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(ckpt)
-    proc.save_pretrained(ckpt)
     import torch
 
+    # Schedule-free AdamW keeps two live views of the weights in p.data: "y"
+    # (raw, used while .train()) and "x" (a slow-moving average, only
+    # materialized under .eval()) -- .eval()/.train() are inverse in-place
+    # transforms of p.data driven by the unchanged optimizer state['z'], and
+    # param_groups['train_mode'] records which one p currently holds.
+    # quick_eval_wer above is measured on "x" (called right after
+    # optimizer.eval()); without this, the checkpoint saved a few lines later
+    # captured "y" instead -- a DIFFERENT set of weights than what was just
+    # scored, than what best_metric.json compares against, and than what
+    # ships to export/inference. Toggling to eval mode for the save (and
+    # saving optimizer.pt in the same window, so its train_mode flag agrees
+    # with which iterate model.safetensors holds -- resume's optimizer.train()
+    # call only re-derives "y" correctly if it does) makes the saved
+    # checkpoint the same weights the reported eval_wer describes.
+    was_training = optimizer.param_groups[0]["train_mode"]
+    if was_training:
+        optimizer.eval()
+    model.save_pretrained(ckpt)
+    proc.save_pretrained(ckpt)
     torch.save(optimizer.state_dict(), ckpt / "optimizer.pt")
+    if was_training:
+        optimizer.train()
     (ckpt / "trainer_state.json").write_text(json.dumps(
         {"global_step": step, "metrics": metrics}, indent=2))
     best = out_dir / "checkpoint-best"

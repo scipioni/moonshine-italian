@@ -134,6 +134,15 @@ def split_sentences(text: str) -> list[str]:
     return [p for p in parts if p]
 
 
+class ChunkSplitImpossible(Exception):
+    """Raised by plan_chunks when no admissible cut point exists.
+
+    Distinguishes "split impossible" from "no split was needed" ([(0, total)])
+    -- both used to reach callers as an empty list, which made an unsplittable
+    utterance indistinguishable from one that didn't need splitting at all.
+    """
+
+
 def plan_chunks(
     spans: list[tuple[int, int]],
     total: int,
@@ -141,7 +150,11 @@ def plan_chunks(
     max_len: int,
 ) -> list[tuple[int, int]]:
     """Plan chunk boundaries [start, end) within [min_len, max_len], cutting
-    at silence gaps when possible. Greedy left-to-right."""
+    at silence gaps when possible. Greedy left-to-right.
+
+    Raises ChunkSplitImpossible if total > max_len but no admissible cut point
+    exists; returns [(0, total)] (a single chunk) when no split is needed.
+    """
     if total <= max_len:
         return [(0, total)]
     boundaries = sorted({0, total, *[s for s, _ in spans], *[e for _, e in spans]})
@@ -152,7 +165,9 @@ def plan_chunks(
         need_lo, need_hi = start + min_len, start + max_len
         candidates = [b for b in boundaries if need_lo <= b <= need_hi]
         if not candidates:
-            return []  # cannot split safely
+            raise ChunkSplitImpossible(
+                f"no admissible cut point in [{need_lo}, {need_hi}] "
+                f"for span [{start}, {total})")
         cut = max(candidates)  # longest possible chunk
         chunks.append((start, cut))
         start = cut
@@ -261,8 +276,9 @@ def prepare_split(
             stats["dropped_empty"] += 1
             continue
 
-        chunks = plan_chunks(spans, len(audio), min_len, max_len)
-        if not chunks:
+        try:
+            chunks = plan_chunks(spans, len(audio), min_len, max_len)
+        except ChunkSplitImpossible:
             stats["dropped_oversize"] += 1
             continue
         texts = split_text_for_chunks(text, chunks)

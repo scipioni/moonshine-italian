@@ -119,28 +119,40 @@ smoke:
 
 training:
   optimizer: "schedulefree_adamw"
-  # Was 5.0e-5 (constant, no decay -- schedule-free's design assumes this is
-  # fine). Full history from checkpoint-2000 (the only genuinely good point
-  # this run ever reached, eval_wer 102.7%): 56,000 further steps, two
-  # restarts, dozens of shuffle seeds, a resume-optimizer-binding fix, a
-  # checkpoint/eval-iterate mismatch fix, and grad_accum_steps=4 (which DID
-  # stabilize gnorm from spiky 30-270+ down to a tight 13-27 band) -- and
-  # WER never beat step 2000 again, drifting to 117-131% in the last stretch
-  # despite the cleaner gradients. Ruling out noise as the primary cause
-  # points at the step size itself being too large for stable convergence at
-  # this stage (curriculum stage 3, full-length up to 30s audio). Lowered
-  # 5x. Restarted from checkpoint-2000 -- the noisy 2000->56000 trajectory
-  # was discarded rather than patched further.
-  learning_rate: 1.0e-5
+  # Reverted to 5.0e-5 (constant, no decay -- schedule-free's design assumes
+  # this is fine) by fix-training-loop-defects task 6.1. The prior value
+  # (1.0e-5) was set from an in-loop eval_wer trajectory (checkpoint-2000
+  # "eval_wer 102.7%", "never beat step 2000 again" over 56,000 further
+  # steps) that was measured on schedule-free AdamW's "x" iterate (the
+  # trajectory average). At step 2000 with a constant LR and
+  # weight_lr_power=2.0, "x" is a near-uniform average still substantially
+  # the pre-fine-tuning English initialization -- measured on the "y"
+  # iterate actually stored in checkpoint-2000, WER was 83.46% (vs the
+  # English base model's 149.87%), i.e. real, fast improvement in the first
+  # 2000 steps. The 56,000-step non-improvement this comment used to cite is
+  # not valid evidence about the learning rate: it describes the wrong
+  # iterate. See openspec/changes/fix-training-loop-defects proposal.md/
+  # design.md for the full account. This value is the un-tuned starting
+  # point pending a fresh measurement under the corrected "y"-iterate metric.
+  learning_rate: 5.0e-5
   betas: [0.9, 0.999]
   weight_decay: 0.01
   warmup_steps: 500
   # Micro-batches averaged into one optimizer update (effective batch =
   # hardware batch_size x this). 1 = off, original per-step-8 behavior.
-  # Kept at 4 (effective batch 32) alongside the learning_rate cut above --
-  # it measurably stabilized gradients even though it wasn't sufficient
-  # alone. Wall time per optimizer step scales ~linearly with this value.
-  grad_accum_steps: 4
+  # Reverted to 1 by fix-training-loop-defects task 6.1: 4 was kept because it
+  # measurably tightened gnorm (30-270+ down to 13-27), which is a real,
+  # metric-independent measurement -- but the decision to keep it was made
+  # alongside the learning_rate cut above using the same broken "x"-iterate
+  # eval_wer trajectory, so it is unjustified even though not necessarily
+  # wrong. Re-introduce it deliberately, one change at a time, against a
+  # metric that satisfies the evaluation spec (see fix-training-loop-defects)
+  # -- not bundled with other changes as it was here. Note gnorm itself is a
+  # weak signal regardless: clip_grad_norm_(max_norm=1.0) already scales
+  # every update down by the full 13-30x observed, and Adam is approximately
+  # invariant to a uniform gradient rescale, so the clipped-norm band mostly
+  # reports how far the raw gradient sits above the clip, not update quality.
+  grad_accum_steps: 1
   # Skip the optimizer step (in addition to the existing non-finite skip
   # below) when the pre-clip grad norm exceeds this, even though it's
   # finite. General safety net -- kept even though it did NOT explain or fix
@@ -180,18 +192,21 @@ training:
       gate: "smoke"
     final:
       output_dir: "results/train-final"
-      # 2 epochs over the mls+common_voice+fleurs mix: 285,401 train rows /
-      # batch 8 (rocm12g) = 35,675 steps/epoch (drop_last) -> 71,350 for 2
-      # epochs, rounded to 72000. At the measured 1.7337 steps/s (from a
-      # prior run's run_metadata.json -- forward/backward/optimizer.step all
-      # ran every step even before the resume-optimizer-binding fix, so the
-      # per-step cost is representative) that's ~11.5h wall time. Was 40000
-      # (~2.9 epochs) when training was mls-only (110,004 rows); the curriculum
-      # below needs no change -- stage_for_step() holds at its last entry
-      # (max_audio_s: 30.0, uncapped) for any step past its 40000-step sum.
-      max_steps: 72000
-      eval_steps: 1000
-      save_steps: 1000
+      # Step budget is expressed in epochs, not a hand-derived step count
+      # (fix-training-loop-defects design Decision 6): max_steps/eval_steps/
+      # save_steps are derived at run start from batch_size x
+      # grad_accum_steps, so changing grad_accum_steps cannot silently change
+      # how many epochs a run performs (it did: an earlier max_steps: 72000
+      # was hand-derived for accum=1 batch=8 -- 285,401 train rows / 8 =
+      # 35,675 steps/epoch -> ~71,350 for 2 epochs, rounded to 72000 -- and
+      # then grad_accum_steps: 4 landed without updating it, silently
+      # quadrupling the run to 8.1 epochs). See run_metadata.json for the
+      # samples/epoch-count actually derived for a given run.
+      target_epochs: 2.0
+      # ~1/36 epoch between evals, matching the cadence intended when
+      # eval_steps: 1000 was originally set (1000 / 35,675 steps-per-epoch at
+      # accum=1, batch=8 ~= 0.028).
+      eval_every_epoch_fraction: 0.028
       # Training manifests to concatenate (data/prepared/<name>/train.jsonl).
       # mls is 216.7h of 19th-century audiobook narration from a handful of
       # narrators; common_voice adds 205.9h from 7,342 speakers (CC0,
@@ -202,10 +217,23 @@ training:
       # mls/validation.jsonl regardless of this list, so the eval/wer curve
       # stays comparable step-to-step as the mix changes.
       datasets: ["mls", "common_voice", "fleurs"]
+      # Resolved fix-training-loop-defects design Decision 5 by measurement:
+      # trimmed to the curriculum's one effective transition rather than
+      # raising preparation.max_duration_s and re-preparing. Measured
+      # cap-bound fraction of each prepared train set (rows >= 9.9s, i.e.
+      # rows a higher cap could actually lengthen): mls 3.5%, fleurs 1.3%,
+      # common_voice 0.0% -- common_voice and fleurs are natively short
+      # utterances, not truncated by the cap, so raising it would only ever
+      # affect mls's audiobook narration, and even there for a small
+      # minority of rows. No board requirement (budget.line_latency_ms_max)
+      # calls for >10s training utterances. A former stage 3 (max_audio_s:
+      # 30.0) was identical to stage 2 against this corpus (nothing exceeds
+      # preparation.max_duration_s: 10.0) and has been merged into it,
+      # keeping the total step budget (8000 + 32000 = 40000) unchanged.
+      # stage_for_step() holds at this last entry for any step past that sum.
       curriculum:
         - { steps: 8000, max_audio_s: 5.0, description: "short clips" }
-        - { steps: 16000, max_audio_s: 10.0, description: "medium clips" }
-        - { steps: 16000, max_audio_s: 30.0, description: "full length" }
+        - { steps: 32000, max_audio_s: 10.0, description: "full corpus" }
       gate: "final"
 
 evaluation:

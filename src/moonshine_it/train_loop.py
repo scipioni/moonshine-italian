@@ -19,7 +19,7 @@ import numpy as np
 from moonshine_it.config import REPO_ROOT, load_config, resolve_profile
 from moonshine_it.evaluate import load_audio
 from moonshine_it.model_io import load_model_and_processor
-from moonshine_it.prepare import plan_chunks, split_text_for_chunks
+from moonshine_it.prepare import split_text_for_chunks
 
 
 class ASRDataset:
@@ -49,6 +49,12 @@ class ASRDataset:
         aug = cfg["training"]["chunked_augmentation"]
         self.augment_p = aug.get("probability", 0.0) if augment else 0.0
         self.min_fraction = aug.get("min_fraction", 0.4)
+        # Startup measurement (see measure_augmentation_fraction below): counts
+        # samples where augmentation was eligible (long enough to attempt) and
+        # samples where a cut was actually applied, so a configured probability
+        # that silently never fires (as it did before this fix) is detectable.
+        self.augment_eligible_count = 0
+        self.augmented_count = 0
 
     def __len__(self):
         return len(self.rows)
@@ -58,19 +64,26 @@ class ASRDataset:
         audio = load_audio(self.audio_root / row["audio"])
         text = row["text"]
         rng = random.Random(f"{self.seed}:{i}")
-        if self.augment_p and rng.random() < self.augment_p and len(audio) > self.min_len * 2:
-            # pretend this utterance is 2x max: split into 2 aligned chunks
-            half = max(self.min_len, len(audio) // 2)
-            chunks = plan_chunks([(0, len(audio))], len(audio), self.min_len,
-                                 max(half, self.min_len + 1))
-            if len(chunks) > 1:
+        if self.augment_p and len(audio) > self.min_len * 2:
+            self.augment_eligible_count += 1
+            if rng.random() < self.augment_p:
+                # No VAD spans are available at this layer (they're consumed
+                # during preparation, not carried in the manifest), so this
+                # can't use plan_chunks' silence-aware cutting -- it asks for a
+                # duration-proportional split instead (design Decision 4): a
+                # randomized cut point within [min_len, len(audio) - min_len],
+                # splitting the transcript proportionally across the two halves.
+                lo, hi = self.min_len, len(audio) - self.min_len
+                cut = rng.randint(lo, hi) if hi > lo else len(audio) // 2
+                chunks = [(0, cut), (cut, len(audio))]
                 texts = split_text_for_chunks(text, chunks)
                 if texts:
-                    ci = rng.randrange(len(chunks))
+                    ci = rng.randrange(2)
                     cs, ce = chunks[ci]
                     frac = (ce - cs) / len(audio)
                     if frac >= self.min_fraction:
                         audio, text = audio[cs:ce], texts[ci]
+                        self.augmented_count += 1
         return {"audio": audio, "text": text}
 
 
@@ -103,6 +116,32 @@ class MultiASRDataset:
 
         di = bisect.bisect_right(self._offsets, i) - 1
         return self.datasets[di][i - self._offsets[di]]
+
+    @property
+    def augment_eligible_count(self) -> int:
+        return sum(d.augment_eligible_count for d in self.datasets)
+
+    @property
+    def augmented_count(self) -> int:
+        return sum(d.augmented_count for d in self.datasets)
+
+
+def measure_augmentation_fraction(dataset, n: int = 200, seed: int = 0) -> float:
+    """Sample up to n items and return the fraction actually augmented among
+    those eligible (long enough to attempt). Returns 0.0 if none were
+    eligible in the sample -- callers must not mistake that for "measured
+    zero augmentation rate" when augmentation is simply rare in a small
+    sample; see the caller in train() for how the zero case is judged."""
+    rng = random.Random(seed)
+    n = min(n, len(dataset))
+    if n == 0:
+        return 0.0
+    before_elig, before_aug = dataset.augment_eligible_count, dataset.augmented_count
+    for i in rng.sample(range(len(dataset)), n):
+        dataset[i]
+    eligible = dataset.augment_eligible_count - before_elig
+    augmented = dataset.augmented_count - before_aug
+    return augmented / eligible if eligible else 0.0
 
 
 class Collator:
@@ -143,6 +182,45 @@ class Collator:
         return {k: v for k, v in inputs.items()}
 
 
+def derive_step_budget(rp, total_samples: int, accum_steps: int, *,
+                       dry_run_steps: int | None = None) -> dict:
+    """Derive max_steps/eval_steps/save_steps from the profile's configured
+    budget (training-pipeline spec: "Step budget is expressed independently
+    of gradient accumulation", design Decision 6).
+
+    Two configuration forms, mutually exclusive on `rp` (enforced by
+    config.py's schema validation):
+    - `rp.target_epochs` set: the budget denotes a fixed amount of *data*
+      (epochs over the dataset), so max_steps changes with accum_steps to
+      hold the sample count constant.
+    - `rp.max_steps` set: a fixed step count regardless of accum_steps (the
+      smoke profile's fixed-slice, fixed-iteration-count use case).
+
+    Returns effective_batch_size, total_samples, epoch_count, max_steps,
+    eval_steps, save_steps -- all suitable for recording in run_metadata.json.
+    """
+    effective_batch_size = rp.batch_size * accum_steps
+    if rp.target_epochs is not None:
+        steps_per_epoch = total_samples // effective_batch_size if effective_batch_size else 0
+        max_steps = (dry_run_steps if dry_run_steps is not None
+                    else round(rp.target_epochs * steps_per_epoch))
+        eval_steps = save_steps = max(
+            1, round(rp.eval_every_epoch_fraction * steps_per_epoch))
+    else:
+        max_steps = dry_run_steps if dry_run_steps is not None else rp.max_steps
+        eval_steps, save_steps = rp.eval_steps, rp.save_steps
+    epoch_count = (max_steps * effective_batch_size / total_samples
+                  if total_samples else 0.0)
+    return {
+        "effective_batch_size": effective_batch_size,
+        "total_samples": total_samples,
+        "epoch_count": round(epoch_count, 4),
+        "max_steps": max_steps,
+        "eval_steps": eval_steps,
+        "save_steps": save_steps,
+    }
+
+
 def stage_for_step(curriculum: list[dict], step: int) -> dict | None:
     """Curriculum stages list cumulative step budgets."""
     cumulative = 0
@@ -153,36 +231,129 @@ def stage_for_step(curriculum: list[dict], step: int) -> dict | None:
     return curriculum[-1] if curriculum else None
 
 
+def validate_curriculum(curriculum: list[dict], rows: list[dict]) -> list[dict]:
+    """Validate curriculum stages against the prepared corpus (training-pipeline
+    spec: "Curriculum stages must be effective against the prepared corpus").
+
+    Each stage after the first must admit strictly more rows than the
+    preceding stage's bound -- otherwise the stage boundary is a config
+    artifact (e.g. a bound that exceeds the corpus's actual maximum duration,
+    same as the preceding stage's), not a real change in the training
+    distribution. Fails loudly naming the ineffective stage rather than
+    silently running an ineffective curriculum.
+
+    Returns a per-stage report ({"steps", "max_audio_s", "row_count"}) for
+    recording in run_metadata.json.
+    """
+    import bisect
+
+    durations = sorted(r["duration_s"] for r in rows)
+
+    def admitted(bound):
+        return bisect.bisect_right(durations, bound) if bound is not None else len(durations)
+
+    report = []
+    prev_bound = prev_count = None
+    for i, stage in enumerate(curriculum):
+        bound = stage.get("max_audio_s")
+        count = admitted(bound)
+        if i > 0 and count == prev_count:
+            corpus_max = durations[-1] if durations else 0.0
+            raise SystemExit(
+                f"curriculum stage {i} ({stage.get('description', '')!r}, "
+                f"max_audio_s={bound}) admits the same {count} rows as the "
+                f"preceding stage (max_audio_s={prev_bound}) -- it is not an "
+                f"effective stage boundary against this corpus (measured "
+                f"maximum duration {corpus_max:.1f}s). See training-pipeline "
+                f"spec 'Curriculum stages must be effective against the "
+                f"prepared corpus'.")
+        report.append({"steps": stage["steps"], "max_audio_s": bound, "row_count": count})
+        prev_bound, prev_count = bound, count
+    return report
+
+
+def iterate_name(optimizer) -> str:
+    """Which schedule-free iterate p.data currently holds.
+
+    AdamWScheduleFree keeps two live views of the weights in p.data: "y" (raw,
+    held while train_mode is True) and "x" (a weighted trajectory average,
+    materialized only under .eval()). .eval()/.train() are inverse in-place
+    transforms of p.data driven by the unchanged optimizer state['z'], and
+    param_groups['train_mode'] records which one p currently holds.
+    """
+    return "y" if optimizer.param_groups[0]["train_mode"] else "x"
+
+
+REGRESSION_STREAK_THRESHOLD = 3
+
+
+def check_iterate_not_regressed(current_wer: float, baseline_wer: float, *,
+                                iterate: str, streak: int = 0,
+                                threshold: int = REGRESSION_STREAK_THRESHOLD) -> int:
+    """Fail loudly if the configured iterate scores worse than the run's own
+    starting point for `threshold` consecutive evals (training-pipeline spec:
+    "Averaged iterate is rejected while it is worse than the starting point").
+
+    A progress metric that ranks below its own initialization cannot order
+    checkpoints -- this is exactly what happened when the "x" iterate was
+    used: at step 2000 it scored 123.11% WER, worse than the 149.87% of the
+    untouched English base model it started from, and emitted English rather
+    than Italian.
+
+    Requires a *sustained* streak, not a single eval, because a model that
+    has barely moved from its initialization (e.g. the very first eval of a
+    fresh run) is statistically indistinguishable from the baseline on a
+    small sample -- whether it lands a hair above or below is close to a
+    coin flip, and a zero-tolerance single-sample check would abort a
+    perfectly healthy run on ordinary early noise. A metric that stays worse
+    than baseline for several evals in a row, in contrast, is the same
+    failure this check exists to catch.
+
+    Returns the updated streak (0 if this eval did not regress, otherwise
+    streak + 1); callers thread this back in on the next call.
+    """
+    if current_wer <= baseline_wer:
+        return 0
+    streak += 1
+    if streak >= threshold:
+        raise SystemExit(
+            f"iterate '{iterate}' WER has been worse than the "
+            f"{baseline_wer:.2f}% baseline measured at this run's start for "
+            f"{streak} consecutive evals (latest: {current_wer:.2f}%) -- this "
+            f"metric cannot be trusted to order checkpoints (design Decision "
+            f"1, fix-training-loop-defects)")
+    return streak
+
+
+def ensure_iterate(optimizer, name: str) -> None:
+    """Force p.data into the named iterate ("x" or "y"), if not already."""
+    if name not in ("x", "y"):
+        raise ValueError(f"unknown iterate {name!r}, expected 'x' or 'y'")
+    if iterate_name(optimizer) == name:
+        return
+    optimizer.train() if name == "y" else optimizer.eval()
+
+
 def save_checkpoint(model, proc, optimizer, out_dir: Path, step: int,
                     metrics: dict) -> Path:
     ckpt = out_dir / f"checkpoint-{step}"
     ckpt.mkdir(parents=True, exist_ok=True)
     import torch
 
-    # Schedule-free AdamW keeps two live views of the weights in p.data: "y"
-    # (raw, used while .train()) and "x" (a slow-moving average, only
-    # materialized under .eval()) -- .eval()/.train() are inverse in-place
-    # transforms of p.data driven by the unchanged optimizer state['z'], and
-    # param_groups['train_mode'] records which one p currently holds.
-    # quick_eval_wer above is measured on "x" (called right after
-    # optimizer.eval()); without this, the checkpoint saved a few lines later
-    # captured "y" instead -- a DIFFERENT set of weights than what was just
-    # scored, than what best_metric.json compares against, and than what
-    # ships to export/inference. Toggling to eval mode for the save (and
-    # saving optimizer.pt in the same window, so its train_mode flag agrees
-    # with which iterate model.safetensors holds -- resume's optimizer.train()
-    # call only re-derives "y" correctly if it does) makes the saved
-    # checkpoint the same weights the reported eval_wer describes.
-    was_training = optimizer.param_groups[0]["train_mode"]
-    if was_training:
-        optimizer.eval()
+    # Standardize on saving the "y" iterate (raw weights), not "x" (the
+    # trajectory average) -- design Decision 1 of fix-training-loop-defects,
+    # reversing the direction of an earlier fix (commit 3390635) that toggled
+    # to "x" for the save. "y" is the only iterate ever measured better than
+    # the model's own initialization; at step 2000 "x" scored WORSE than the
+    # untouched English base model and emitted English, because with a
+    # constant learning rate and weight_lr_power=2.0 the average is still
+    # substantially the pre-fine-tuning initialization this early in a run.
+    ensure_iterate(optimizer, "y")
     model.save_pretrained(ckpt)
     proc.save_pretrained(ckpt)
     torch.save(optimizer.state_dict(), ckpt / "optimizer.pt")
-    if was_training:
-        optimizer.train()
     (ckpt / "trainer_state.json").write_text(json.dumps(
-        {"global_step": step, "metrics": metrics}, indent=2))
+        {"global_step": step, "metrics": metrics, "iterate": "y"}, indent=2))
     best = out_dir / "checkpoint-best"
     marker = out_dir / "best_metric.json"
     prev_best = json.loads(marker.read_text()) if marker.exists() else None
@@ -213,7 +384,15 @@ def find_latest_checkpoint(out_dir: Path) -> Path | None:
 
 
 def quick_eval_wer(model, proc, manifest: Path, audio_root: Path, cfg: dict,
-                   limit: int | None = None) -> float:
+                   *, split_name: str, iterate: str, limit: int | None = None) -> dict:
+    """In-loop evaluation. Returns a dict naming its provenance (evaluation
+    spec: "In-loop training metric is self-describing and gate-comparable") --
+    the split it was measured on, the sample count, and the optimizer iterate
+    the model was in when scored. Callers are responsible for having already
+    placed the model in the intended iterate (see ensure_iterate); this
+    function does not touch optimizer state so it can be used standalone
+    against an already-loaded checkpoint.
+    """
     import jiwer
 
     from moonshine_it.evaluate import transcribe_full
@@ -230,7 +409,9 @@ def quick_eval_wer(model, proc, manifest: Path, audio_root: Path, cfg: dict,
 
         refs.append(normalize_text(row["text"], expand_nums=False))
         hyps.append(normalize_text(hyp, expand_nums=False))
-    return float(jiwer.wer(refs, hyps)) * 100
+    wer = float(jiwer.wer(refs, hyps)) * 100
+    return {"eval_wer": wer, "iterate": iterate, "eval_split": split_name,
+            "eval_n": len(rows)}
 
 
 def train(
@@ -272,6 +453,7 @@ def train(
         audio_root = smoke_root / "audio"
         val_manifest = smoke_root / "test.jsonl"
         val_audio = smoke_root / "audio"
+        val_split_name = "smoke-slice/test"
         if not manifest.exists():
             raise SystemExit(f"training manifest missing: {manifest} — run prepare first")
         dataset = ASRDataset(manifest, audio_root, cfg, augment=True,
@@ -283,6 +465,12 @@ def train(
         val_root = REPO_ROOT / cfg["paths"]["data"] / "prepared" / "mls"
         val_manifest = val_root / "validation.jsonl"
         val_audio = val_root
+        # Deliberately different from the `final` gate's split (FLEURS-it
+        # test): distinct distributions (measured median 13.1 vs 18.0
+        # chars/s), so this in-loop value is not directly comparable to that
+        # gate's threshold (evaluation spec: "In-loop metric is comparable to
+        # its gate" -- it is not, here, and callers must not treat it as such).
+        val_split_name = "mls/validation"
 
         parts = []
         for name in rp.datasets:
@@ -297,6 +485,37 @@ def train(
             print(f"train[{training_profile}]: +{name} "
                   f"({len(parts[-1])} rows, {data_manifest})")
         dataset = parts[0] if len(parts) == 1 else MultiASRDataset(parts)
+
+    # Configured augmentation must actually execute (evaluation spec: "In-loop
+    # metric" / training-pipeline spec: "Configured augmentation must
+    # execute"). A configured probability that silently applies to zero
+    # samples -- as chunked augmentation did before this check existed,
+    # because ASRDataset.__getitem__ called plan_chunks with a span offering
+    # no admissible cut point -- is a configuration error, not a no-op.
+    configured_aug_p = cfg["training"]["chunked_augmentation"].get("probability", 0.0)
+    if configured_aug_p:
+        measured_frac = measure_augmentation_fraction(dataset)
+        print(f"  augmentation check: configured p={configured_aug_p}, "
+              f"measured fraction augmented over startup sample = {measured_frac:.3f}")
+        if measured_frac == 0.0:
+            raise SystemExit(
+                f"chunked_augmentation.probability={configured_aug_p} is configured "
+                f"but 0 of a startup sample were actually augmented — augmentation "
+                f"is silently not executing")
+
+    # Curriculum stages must be effective against the prepared corpus
+    # (training-pipeline spec) -- fails loudly rather than running a
+    # curriculum whose stages are indistinguishable (e.g. two stages both
+    # bounded above the corpus's actual maximum duration).
+    curriculum_report = validate_curriculum(rp.curriculum, dataset.rows)
+    if curriculum_report:
+        for s in curriculum_report:
+            print(f"  curriculum: steps={s['steps']} max_audio_s={s['max_audio_s']} "
+                  f"row_count={s['row_count']}")
+        meta = json.loads((out_dir / "run_metadata.json").read_text())
+        meta["curriculum"] = curriculum_report
+        (out_dir / "run_metadata.json").write_text(json.dumps(meta, indent=2))
+
     # Deliberately separate from cfg["smoke"]["seed"] (which still seeds
     # per-item augmentation via ASRDataset above) -- see training.shuffle_seed
     # in config.yaml for why. MOONSHINE_SHUFFLE_SEED lets a retry wrapper vary
@@ -360,7 +579,37 @@ def train(
             "optimizer is not bound to the model's parameters — optimizer.step() "
             "would be a no-op and training would silently do nothing")
 
-    max_steps = dry_run_steps if dry_run_steps is not None else rp.max_steps
+    # Ensure the resumed optimizer state agrees with the "y" convention before
+    # measuring the run's starting-point baseline (design Decision 1/2).
+    ensure_iterate(optimizer, "y")
+
+    # Baseline for the sanity latch below (training-pipeline spec: "Averaged
+    # iterate is rejected while it is worse than the starting point") -- the
+    # model as loaded for this run, before any of its own training steps.
+    model.eval()
+    baseline_wer = quick_eval_wer(model, proc, val_manifest, val_audio, cfg,
+                                  split_name=val_split_name, iterate="y")["eval_wer"]
+    model.train()
+    print(f"  baseline WER at run start (iterate=y, split={val_split_name}): "
+          f"{baseline_wer:.2f}%")
+
+    # Step budget is expressed independently of gradient accumulation
+    # (training-pipeline spec) -- accum_steps is fixed before max_steps/
+    # eval_steps/save_steps are derived, so changing it cannot silently
+    # change how many epochs a run performs (design Decision 6).
+    accum_steps = max(1, int(tcfg.get("grad_accum_steps", 1)))
+    budget = derive_step_budget(rp, len(dataset), accum_steps,
+                                dry_run_steps=dry_run_steps)
+    max_steps, eval_steps, save_steps = (
+        budget["max_steps"], budget["eval_steps"], budget["save_steps"])
+    meta = json.loads((out_dir / "run_metadata.json").read_text())
+    meta.update(budget)
+    (out_dir / "run_metadata.json").write_text(json.dumps(meta, indent=2))
+    print(f"  step budget: effective_batch={budget['effective_batch_size']} "
+          f"(batch={rp.batch_size} x accum={accum_steps}), "
+          f"samples={budget['total_samples']}, epochs={budget['epoch_count']:.3f}, "
+          f"max_steps={max_steps}, eval/save_steps={eval_steps}")
+
     writer = SummaryWriter(log_dir=str(out_dir / "runs"))
     autocast_dtype = {"bf16": torch.bfloat16, "fp32": None}[rp.precision]
     import contextlib
@@ -371,6 +620,7 @@ def train(
 
     step = start_step
     epoch = 0
+    regression_streak = 0
     t_start = time.time()
     while step < max_steps:
         # curriculum: rebuild dataset view for the current stage
@@ -390,16 +640,14 @@ def train(
 
         optimizer.train()
         skipped = 0
-        # Gradient accumulation: batch=8 with no accumulation gave a very
-        # noisy per-step gradient (frequent large gnorm spikes, e.g. 50-200+
-        # against a typical 10-60, needing aggressive clip_grad_norm_ every
-        # step) -- a plausible contributor to a run where loss barely moved
-        # and eval WER got noisier/worse over 72k steps rather than
-        # improving. accum_steps averages the gradient over more samples
-        # before each update, at the cost of accum_steps x wall time per
-        # optimizer step. 1 (default) reproduces the original behavior
-        # exactly.
-        accum_steps = max(1, int(tcfg.get("grad_accum_steps", 1)))
+        # Gradient accumulation (accum_steps fixed above, before the step
+        # budget was derived from it): batch=8 with no accumulation gave a
+        # very noisy per-step gradient (frequent large gnorm spikes, e.g.
+        # 50-200+ against a typical 10-60, needing aggressive
+        # clip_grad_norm_ every step). accum_steps averages the gradient over
+        # more samples before each update, at the cost of accum_steps x wall
+        # time per optimizer step. 1 (default) reproduces the original
+        # per-step behavior exactly.
         micro = 0
         accum_loss = 0.0
         for batch in stage_loader:
@@ -473,17 +721,24 @@ def train(
                       f"gnorm {float(grad_norm):.2f} "
                       f"({(time.time()-t_start):.0f}s)", flush=True)
 
-            if step % rp.eval_steps == 0:
+            if step % eval_steps == 0:
                 torch.cuda.synchronize()  # scoped: settle the step before eval
-                optimizer.eval()
+                # Measure on "y" -- do NOT call optimizer.eval() here, which
+                # would convert p.data to the "x" trajectory average for the
+                # duration of the measurement. See save_checkpoint above.
+                ensure_iterate(optimizer, "y")
                 model.eval()
-                wer = quick_eval_wer(model, proc, val_manifest, val_audio, cfg)
+                metrics = quick_eval_wer(model, proc, val_manifest, val_audio, cfg,
+                                         split_name=val_split_name, iterate="y")
                 model.train()
-                optimizer.train()
+                wer = metrics["eval_wer"]
+                regression_streak = check_iterate_not_regressed(
+                    wer, baseline_wer, iterate="y", streak=regression_streak)
                 writer.add_scalar("eval/wer", wer, step)
-                print(f"  step {step} eval WER {wer:.1f}%", flush=True)
-                metrics = {"eval_wer": wer}
-            if step % rp.save_steps == 0:
+                print(f"  step {step} eval WER {wer:.1f}% "
+                      f"(iterate=y, split={val_split_name}, n={metrics['eval_n']})",
+                      flush=True)
+            if step % save_steps == 0:
                 torch.cuda.synchronize()  # scoped: settle the step before saving
                 metrics = locals().get("metrics", {}) or {}
                 save_checkpoint(model, proc, optimizer, out_dir, step, metrics)

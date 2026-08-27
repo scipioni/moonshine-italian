@@ -84,12 +84,37 @@ def _validate(cfg: dict[str, Any]) -> None:
     for name in VALID_TRAIN_PROFILES:
         if name not in profiles:
             raise ConfigError(f"config.yaml: training.profiles.{name} is required")
-        for key in ("output_dir", "max_steps", "eval_steps", "save_steps", "gate"):
-            if key not in profiles[name]:
+        prof = profiles[name]
+        for key in ("output_dir", "gate"):
+            if key not in prof:
                 raise ConfigError(
                     f"config.yaml: training.profiles.{name}.{key} is required"
                 )
-        if profiles[name]["gate"] not in _require(_require(cfg, "evaluation"), "gates"):
+        # Step budget must be either a fixed step count or epoch-derived
+        # (training-pipeline spec: "Step budget is expressed independently
+        # of gradient accumulation") -- exactly one of the two forms, so a
+        # run's length is never ambiguous between them.
+        has_fixed_steps = "max_steps" in prof
+        has_epoch_budget = "target_epochs" in prof
+        if has_fixed_steps == has_epoch_budget:
+            raise ConfigError(
+                f"config.yaml: training.profiles.{name} must set exactly one "
+                "of 'max_steps' (with eval_steps/save_steps) or "
+                "'target_epochs' (with eval_every_epoch_fraction)"
+            )
+        if has_fixed_steps:
+            for key in ("eval_steps", "save_steps"):
+                if key not in prof:
+                    raise ConfigError(
+                        f"config.yaml: training.profiles.{name}.{key} is "
+                        "required alongside max_steps"
+                    )
+        elif "eval_every_epoch_fraction" not in prof:
+            raise ConfigError(
+                f"config.yaml: training.profiles.{name}.eval_every_epoch_fraction "
+                "is required alongside target_epochs"
+            )
+        if prof["gate"] not in _require(_require(cfg, "evaluation"), "gates"):
             raise ConfigError(
                 f"config.yaml: training.profiles.{name}.gate references an unknown gate"
             )
@@ -126,9 +151,11 @@ class ResolvedProfile:
     ort_provider: str
     steps_per_second_min: float | None
     output_dir: Path
-    max_steps: int
-    eval_steps: int
-    save_steps: int
+    max_steps: int | None
+    eval_steps: int | None
+    save_steps: int | None
+    target_epochs: float | None
+    eval_every_epoch_fraction: float | None
     curriculum: list[dict[str, Any]]
     gate: str
     datasets: list[str]
@@ -177,9 +204,11 @@ def resolve_profile(
         ort_provider=hw["ort_provider"],
         steps_per_second_min=hw.get("steps_per_second_min"),
         output_dir=REPO_ROOT / tp["output_dir"],
-        max_steps=tp["max_steps"],
-        eval_steps=tp["eval_steps"],
-        save_steps=tp["save_steps"],
+        max_steps=tp.get("max_steps"),
+        eval_steps=tp.get("eval_steps"),
+        save_steps=tp.get("save_steps"),
+        target_epochs=tp.get("target_epochs"),
+        eval_every_epoch_fraction=tp.get("eval_every_epoch_fraction"),
         curriculum=list(tp.get("curriculum") or []),
         gate=tp["gate"],
         # Training manifests to concatenate: data/prepared/<name>/train.jsonl

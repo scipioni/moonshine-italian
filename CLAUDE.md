@@ -40,7 +40,7 @@ task ort PROFILE=rocm12g
 task ort-eval PROFILE=rocm12g
 task validate PROFILE=rocm12g
 task release PROFILE=rocm12g                # export -> ort -> ort-eval -> validate
-task final-train PROFILE=strix              # requires results/smoke/record.json
+task final-train PROFILE=rocm12g            # requires results/smoke/record.json
 task board-deploy PROFILE=rocm12g           # requires BOARD_HOST
 ```
 
@@ -155,7 +155,14 @@ the JSON rather than re-deriving numbers.
 ## Conventions
 
 - Do not add a `Co-Authored-By` line to git commits.
-- The Strix Halo box ("max", `PROFILE=strix`) is reachable via `ssh scipio@max`.
+- The Strix Halo box ("max", `PROFILE=strix`) is reachable via `ssh scipio@max`,
+  but is benched for training: a 26 GB ollama model is pinned to the same
+  unified-memory iGPU, causing intermittent 60–128 s/step stalls. Final
+  training runs on `rocm12g` (see the profile note in `config.yaml`). The box
+  also has no prepared-corpus copy — `data/prepared/` (52 GB) is local-only.
+- Long final runs go through `scripts/supervise_final_train.sh`, which
+  restarts on the known amdgpu page fault and varies `MOONSHINE_SHUFFLE_SEED`
+  per attempt (an unchanged seed re-walks the loader into the same fault).
 - Hardware profiles (`rocm12g`, `strix`, `cuda`) and training profiles
   (`smoke`, `final`) are validated against `config.py`'s
   `VALID_HW_PROFILES`/`VALID_TRAIN_PROFILES` — extend these plus

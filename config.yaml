@@ -207,6 +207,22 @@ training:
       # eval_steps: 1000 was originally set (1000 / 35,675 steps-per-epoch at
       # accum=1, batch=8 ~= 0.028).
       eval_every_epoch_fraction: 0.028
+      # Checkpoint far more often than we evaluate. Measured 2026-08-27: with
+      # save_steps tied to eval_steps (999), the rocm12g amdgpu page fault
+      # documented above fired in the step 3200-3500 window on 4 consecutive
+      # supervisor attempts, every one of them before reaching the next save
+      # at 3996. The run livelocked -- each restart reloaded the identical
+      # checkpoint-2997 weights and re-walked into the same fault, so varying
+      # MOONSHINE_SHUFFLE_SEED alone did not break out of it. A tighter save
+      # cadence lets the run ratchet forward: each restart resumes from later
+      # weights, which is the same "checkpoint round-trip perturbation" that
+      # the profile note above records as sufficient to avoid the crash.
+      max_save_interval_steps: 250
+      # 250-step saves would otherwise write ~270 x 806 MB over the full run.
+      keep_last_checkpoints: 3
+      # Never pruned: the pre-fix evidence base that fix-training-loop-defects
+      # and the vocabulary-transplantation proposal both cite by step number.
+      protected_checkpoints: [1000, 2000, 2997]
       # Training manifests to concatenate (data/prepared/<name>/train.jsonl).
       # mls is 216.7h of 19th-century audiobook narration from a handful of
       # narrators; common_voice adds 205.9h from 7,342 speakers (CC0,

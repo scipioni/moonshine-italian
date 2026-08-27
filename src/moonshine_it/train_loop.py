@@ -206,6 +206,16 @@ def derive_step_budget(rp, total_samples: int, accum_steps: int, *,
                     else round(rp.target_epochs * steps_per_epoch))
         eval_steps = save_steps = max(
             1, round(rp.eval_every_epoch_fraction * steps_per_epoch))
+        # Checkpoint cadence may be tightened below the eval cadence without
+        # changing the budget: on rocm12g the amdgpu page fault (see the
+        # profile note in config.yaml) costs every step since the last save,
+        # and if the fault window is shorter than the save interval the run
+        # livelocks -- it rolls back to the same checkpoint, reloads the same
+        # weights, and re-walks into the same fault. Saving more often lets
+        # the run ratchet past the fault instead. Eval stays on the wider
+        # cadence because it is the expensive half.
+        if rp.max_save_interval_steps is not None:
+            save_steps = max(1, min(save_steps, rp.max_save_interval_steps))
     else:
         max_steps = dry_run_steps if dry_run_steps is not None else rp.max_steps
         eval_steps, save_steps = rp.eval_steps, rp.save_steps
@@ -368,8 +378,71 @@ def save_checkpoint(model, proc, optimizer, out_dir: Path, step: int,
 
             shutil.rmtree(best)  # pre-existing real dir from before this change
         best.symlink_to(ckpt, target_is_directory=True)
-        marker.write_text(json.dumps({"global_step": step, "eval_wer": score}, indent=2))
+        # Carry the metric's provenance, not just its value: a bare
+        # {step, eval_wer} pair cannot be traced back to a reproducible
+        # measurement, which the evaluation spec requires of any recorded
+        # number used to rank checkpoints.
+        marker.write_text(json.dumps(
+            {"global_step": step, "eval_wer": score,
+             "iterate": metrics.get("iterate"),
+             "eval_split": metrics.get("eval_split"),
+             "eval_n": metrics.get("eval_n")}, indent=2))
     return ckpt
+
+
+def prune_checkpoints(out_dir: Path, keep_last: int | None,
+                      protected: set[int] | None = None) -> list[Path]:
+    """Delete all but the newest `keep_last` checkpoints.
+
+    Tightening the save cadence to survive the amdgpu fault (see
+    derive_step_budget) would otherwise write ~270 x 806 MB over a full run.
+    Never removes the checkpoint `checkpoint-best` points at, nor any step in
+    `protected` -- those are the recorded evidence the change's proposal
+    cites, and results-are-the-record means they outlive the run that made
+    them. Returns what was removed.
+    """
+    if keep_last is None:
+        return []
+    import shutil
+
+    protected = set(protected or ())
+    best = out_dir / "checkpoint-best"
+    if best.is_symlink():
+        protected.add(int(best.resolve().name.split("-")[1]))
+
+    ckpts = sorted(
+        (p for p in out_dir.glob("checkpoint-[0-9]*") if p.is_dir()),
+        key=lambda p: int(p.name.split("-")[1]),
+    )
+    removed = []
+    for ckpt in ckpts[:-keep_last] if keep_last > 0 else ckpts:
+        if int(ckpt.name.split("-")[1]) in protected:
+            continue
+        shutil.rmtree(ckpt)
+        removed.append(ckpt)
+    return removed
+
+
+def record_eval(out_dir: Path, step: int, metrics: dict) -> Path:
+    """Append one in-loop evaluation to the run record.
+
+    The evaluation spec ("In-loop training metric is self-describing and
+    gate-comparable") requires the value to be written to the run record and
+    to carry its provenance, "rather than only to the training log". Stdout
+    and the TensorBoard event file are neither durable nor greppable as the
+    WER curve the results-are-the-record convention expects, so every eval
+    lands here as one JSON object per line.
+    """
+    path = out_dir / "eval_history.jsonl"
+    row = {"global_step": step,
+           "eval_wer": metrics["eval_wer"],
+           "iterate": metrics["iterate"],
+           "eval_split": metrics["eval_split"],
+           "eval_n": metrics["eval_n"],
+           "recorded": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    with path.open("a") as fh:
+        fh.write(json.dumps(row) + "\n")
+    return path
 
 
 def find_latest_checkpoint(out_dir: Path) -> Path | None:
@@ -608,7 +681,10 @@ def train(
     print(f"  step budget: effective_batch={budget['effective_batch_size']} "
           f"(batch={rp.batch_size} x accum={accum_steps}), "
           f"samples={budget['total_samples']}, epochs={budget['epoch_count']:.3f}, "
-          f"max_steps={max_steps}, eval/save_steps={eval_steps}")
+          f"max_steps={max_steps}, eval_steps={eval_steps}, "
+          f"save_steps={save_steps}")
+
+    protected_checkpoints = set(rp.protected_checkpoints)
 
     writer = SummaryWriter(log_dir=str(out_dir / "runs"))
     autocast_dtype = {"bf16": torch.bfloat16, "fp32": None}[rp.precision]
@@ -735,6 +811,7 @@ def train(
                 regression_streak = check_iterate_not_regressed(
                     wer, baseline_wer, iterate="y", streak=regression_streak)
                 writer.add_scalar("eval/wer", wer, step)
+                record_eval(out_dir, step, metrics)
                 print(f"  step {step} eval WER {wer:.1f}% "
                       f"(iterate=y, split={val_split_name}, n={metrics['eval_n']})",
                       flush=True)
@@ -742,6 +819,8 @@ def train(
                 torch.cuda.synchronize()  # scoped: settle the step before saving
                 metrics = locals().get("metrics", {}) or {}
                 save_checkpoint(model, proc, optimizer, out_dir, step, metrics)
+                prune_checkpoints(out_dir, rp.keep_last_checkpoints,
+                                  protected=protected_checkpoints)
         epoch += 1
 
     metrics = locals().get("metrics", {}) or {}

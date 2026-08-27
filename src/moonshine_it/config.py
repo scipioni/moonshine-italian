@@ -156,6 +156,9 @@ class ResolvedProfile:
     save_steps: int | None
     target_epochs: float | None
     eval_every_epoch_fraction: float | None
+    max_save_interval_steps: int | None
+    keep_last_checkpoints: int | None
+    protected_checkpoints: list[int]
     curriculum: list[dict[str, Any]]
     gate: str
     datasets: list[str]
@@ -209,6 +212,12 @@ def resolve_profile(
         save_steps=tp.get("save_steps"),
         target_epochs=tp.get("target_epochs"),
         eval_every_epoch_fraction=tp.get("eval_every_epoch_fraction"),
+        # All three optional: crash-recovery tuning, not part of the step
+        # budget. Absent (e.g. smoke) means "save with the eval cadence, keep
+        # everything", which is the pre-existing behavior.
+        max_save_interval_steps=tp.get("max_save_interval_steps"),
+        keep_last_checkpoints=tp.get("keep_last_checkpoints"),
+        protected_checkpoints=[int(s) for s in (tp.get("protected_checkpoints") or [])],
         curriculum=list(tp.get("curriculum") or []),
         gate=tp["gate"],
         # Training manifests to concatenate: data/prepared/<name>/train.jsonl

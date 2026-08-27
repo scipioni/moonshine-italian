@@ -13,11 +13,17 @@ from moonshine_it.train_loop import derive_step_budget
 
 
 def _rp(batch_size=8, target_epochs=2.0, eval_every_epoch_fraction=0.028,
-       max_steps=None, eval_steps=None, save_steps=None):
+       max_steps=None, eval_steps=None, save_steps=None,
+       max_save_interval_steps=None):
+    # Mirrors ResolvedProfile's fields that derive_step_budget reads.
+    # max_save_interval_steps defaults to None here so these cases keep
+    # asserting the uncapped derivation; the cap has its own tests in
+    # tests/test_checkpoint_retention.py.
     return SimpleNamespace(batch_size=batch_size, target_epochs=target_epochs,
                           eval_every_epoch_fraction=eval_every_epoch_fraction,
                           max_steps=max_steps, eval_steps=eval_steps,
-                          save_steps=save_steps)
+                          save_steps=save_steps,
+                          max_save_interval_steps=max_save_interval_steps)
 
 
 def test_accumulation_change_preserves_sample_and_epoch_count():

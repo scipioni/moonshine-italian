@@ -119,22 +119,27 @@ smoke:
 
 training:
   optimizer: "schedulefree_adamw"
-  learning_rate: 5.0e-5
+  # Was 5.0e-5 (constant, no decay -- schedule-free's design assumes this is
+  # fine). Full history from checkpoint-2000 (the only genuinely good point
+  # this run ever reached, eval_wer 102.7%): 56,000 further steps, two
+  # restarts, dozens of shuffle seeds, a resume-optimizer-binding fix, a
+  # checkpoint/eval-iterate mismatch fix, and grad_accum_steps=4 (which DID
+  # stabilize gnorm from spiky 30-270+ down to a tight 13-27 band) -- and
+  # WER never beat step 2000 again, drifting to 117-131% in the last stretch
+  # despite the cleaner gradients. Ruling out noise as the primary cause
+  # points at the step size itself being too large for stable convergence at
+  # this stage (curriculum stage 3, full-length up to 30s audio). Lowered
+  # 5x. Restarted from checkpoint-2000 -- the noisy 2000->56000 trajectory
+  # was discarded rather than patched further.
+  learning_rate: 1.0e-5
   betas: [0.9, 0.999]
   weight_decay: 0.01
   warmup_steps: 500
   # Micro-batches averaged into one optimizer update (effective batch =
   # hardware batch_size x this). 1 = off, original per-step-8 behavior.
-  # The step-2000..72000 final run (batch=8, no accumulation) showed
-  # frequent large gnorm spikes (50-200+ against a typical 10-60) and,
-  # despite clip_grad_norm_ + max_grad_norm_skip below, loss barely moved
-  # while eval WER got noisier/worse rather than improving -- a plausible
-  # gradient-noise signature. Confirmed on retry: after fixing the separate
-  # checkpoint/eval-iterate mismatch bug (train_loop.py save_checkpoint),
-  # 10 clean evals from step 43000-53000 still showed no improvement
-  # (114.3 -> 127.8%, checkpoint-best still step 2000) -- raising this to 4
-  # (effective batch 32) now. Wall time per optimizer step scales
-  # ~linearly with this value.
+  # Kept at 4 (effective batch 32) alongside the learning_rate cut above --
+  # it measurably stabilized gradients even though it wasn't sufficient
+  # alone. Wall time per optimizer step scales ~linearly with this value.
   grad_accum_steps: 4
   # Skip the optimizer step (in addition to the existing non-finite skip
   # below) when the pre-clip grad norm exceeds this, even though it's

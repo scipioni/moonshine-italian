@@ -123,6 +123,17 @@ training:
   betas: [0.9, 0.999]
   weight_decay: 0.01
   warmup_steps: 500
+  # Micro-batches averaged into one optimizer update (effective batch =
+  # hardware batch_size x this). 1 = off, original per-step-8 behavior.
+  # The step-2000..72000 final run (batch=8, no accumulation) showed
+  # frequent large gnorm spikes (50-200+ against a typical 10-60) and,
+  # despite clip_grad_norm_ + max_grad_norm_skip below, loss barely moved
+  # while eval WER got noisier/worse rather than improving -- a plausible
+  # gradient-noise signature. If a retrain from checkpoint-2000 shows the
+  # same non-improving/worsening WER pattern again, raising this (try 4,
+  # effective batch 32) is the first thing to try before anything else --
+  # wall time per optimizer step scales ~linearly with this value.
+  grad_accum_steps: 1
   # Skip the optimizer step (in addition to the existing non-finite skip
   # below) when the pre-clip grad norm exceeds this, even though it's
   # finite. General safety net -- kept even though it did NOT explain or fix

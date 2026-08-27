@@ -36,6 +36,8 @@ class ASRDataset:
         from moonshine_it.evaluate import load_manifest
 
         self.rows = load_manifest(manifest)
+        # Filter out corrupted rows with astronomically long transcripts (causes SDPA CUDA OOM)
+        self.rows = [r for r in self.rows if len(r.get("text", "")) <= 500]
         if max_audio_s is not None:
             self.rows = [r for r in self.rows if r["duration_s"] <= max_audio_s]
         self.audio_root = audio_root

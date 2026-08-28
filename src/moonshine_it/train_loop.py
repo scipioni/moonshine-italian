@@ -769,8 +769,19 @@ def train(
 
     t_start = time.time()
     while step < max_steps:
-        # curriculum: rebuild dataset view for the current stage
+        # curriculum: rebuild dataset view for the current stage.
+        #
+        # The stage is re-read here, once per pass over the current stage's
+        # view, and the inner loop breaks out the moment the stage index
+        # changes (see below). Without that break the boundary is only
+        # observed when the view is exhausted: stage 0 admits 144,493 rows,
+        # so a pass is ~18,061 steps, and a crash-free run resuming at 2,997
+        # would not enter stage 1 until step ~21,058 -- not the step 8,000
+        # the curriculum configures. On the live run only the amdgpu-fault
+        # restarts advanced it, because each restart recomputes the stage
+        # from the step it resumed at.
         stage = stage_for_step(rp.curriculum, step) if rp.curriculum else None
+        active_stage_index = stage_index_for_step(rp.curriculum, step)
         max_audio_s = stage["max_audio_s"] if stage else None
         if max_audio_s:
             view = Subset(dataset, [i for i, r in enumerate(dataset.rows)
@@ -916,7 +927,15 @@ def train(
                                 m if m.get("global_step") == step else {})
                 prune_checkpoints(out_dir, rp.keep_last_checkpoints,
                                   protected=protected_checkpoints)
-        epoch += 1
+            # Honour the configured stage boundary at the step it names,
+            # rather than whenever this stage's view happens to run out.
+            if stage_index_for_step(rp.curriculum, step) != active_stage_index:
+                print(f"  curriculum: stage {active_stage_index} -> "
+                      f"{stage_index_for_step(rp.curriculum, step)} at step "
+                      f"{step}, rebuilding the dataset view", flush=True)
+                break
+        else:
+            epoch += 1
 
     metrics = locals().get("metrics", {}) or {}
     save_checkpoint(model, proc, optimizer, out_dir, step, metrics)

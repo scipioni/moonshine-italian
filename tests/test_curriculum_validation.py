@@ -57,3 +57,25 @@ def test_real_config_final_curriculum_is_now_effective():
     assert [s["row_count"] for s in report] == [3, 5]  # strictly increasing
     total_steps = sum(s["steps"] for s in curriculum)
     assert total_steps == 40_000, "trim must preserve the total step budget"
+
+
+def test_stage_boundary_is_not_reachable_by_view_exhaustion():
+    """Why the training loop must break out of its inner loop at the stage
+    boundary instead of waiting for the current view to run out.
+
+    Measured on the real corpus: stage 0 (max_audio_s 5.0) admits 144,493 of
+    285,395 rows, so one pass at batch 8 is ~18,061 steps -- more than twice
+    the 8,000 steps the stage is budgeted. A crash-free run resuming at 2,997
+    would therefore not enter stage 1 until step ~21,058, and the configured
+    boundary would never be honoured on its own terms.
+    """
+    stage0_rows, batch_size = 144_493, 8
+    stage0_budget = 8_000
+
+    steps_per_pass = stage0_rows // batch_size
+    assert steps_per_pass > stage0_budget, (
+        "if a pass were shorter than the stage budget, exhaustion would "
+        "happen to switch the stage on time and this guard would be moot")
+
+    resumed_at = 2_997
+    assert resumed_at + steps_per_pass > stage0_budget

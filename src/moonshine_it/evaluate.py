@@ -215,7 +215,8 @@ def evaluate_manifest(
     hyps: list[str] = []
     stats_all: list[dict] = []
 
-    for row in rows:
+    total = len(rows)
+    for i, row in enumerate(rows):
         audio = load_audio(audio_root / row["audio"])
         ref = normalize_text(row["text"], expand_nums=False)
         if mode == "full":
@@ -235,6 +236,10 @@ def evaluate_manifest(
         hyp = normalize_text(hyp, expand_nums=False)
         refs.append(ref)
         hyps.append(hyp)
+        if (i + 1) % 5 == 0 or (i + 1) == total:
+            import sys
+            sys.stdout.write(f"  [{mode}] {i + 1}/{total} evaluated\n")
+            sys.stdout.flush()
 
     wer = float(jiwer.wer(refs, hyps)) * 100
     cer = float(jiwer.cer(refs, hyps)) * 100

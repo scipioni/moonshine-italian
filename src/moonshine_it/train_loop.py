@@ -292,7 +292,7 @@ def validate_curriculum(curriculum: list[dict], rows: list[dict]) -> list[dict]:
         count = admitted(bound)
         if i > 0 and count == prev_count:
             corpus_max = durations[-1] if durations else 0.0
-            raise SystemExit(
+            raise PolicyStop(
                 f"curriculum stage {i} ({stage.get('description', '')!r}, "
                 f"max_audio_s={bound}) admits the same {count} rows as the "
                 f"preceding stage (max_audio_s={prev_bound}) -- it is not an "
@@ -349,13 +349,40 @@ def check_iterate_not_regressed(current_wer: float, baseline_wer: float, *,
         return 0
     streak += 1
     if streak >= threshold:
-        raise SystemExit(
+        raise PolicyStop(
             f"iterate '{iterate}' WER has been worse than the "
             f"{baseline_wer:.2f}% baseline measured at this run's start for "
             f"{streak} consecutive evals (latest: {current_wer:.2f}%) -- this "
             f"metric cannot be trusted to order checkpoints (design Decision "
             f"1, fix-training-loop-defects)")
     return streak
+
+
+POLICY_STOP_EXIT_CODE = 3
+
+
+class PolicyStop(SystemExit):
+    """A deliberate refusal to continue -- a latch or gate saying "this run
+    should not go on" -- as distinct from a crash.
+
+    Both used to leave the process with exit status 1, which a restart
+    supervisor cannot tell apart from the amdgpu page fault. Measured
+    2026-08-28: the regression latch fired correctly at step 14,000 and
+    scripts/supervise_final_train.sh restarted the run ~127 times over eight
+    hours, re-running the same three failing evals each time. A policy stop
+    exits with POLICY_STOP_EXIT_CODE so a supervisor stops instead.
+
+    Remains a SystemExit so existing `raise SystemExit`-based latch handling
+    and tests keep working.
+    """
+
+    def __init__(self, message: str):
+        self.message = message
+        print(message, flush=True)
+        super().__init__(POLICY_STOP_EXIT_CODE)
+
+    def __str__(self) -> str:
+        return self.message
 
 
 def ensure_iterate(optimizer, name: str) -> None:
@@ -953,7 +980,7 @@ def train(
     (out_dir / "run_metadata.json").write_text(json.dumps(meta, indent=2))
     if rp.steps_per_second_min is not None and done_steps > 0:
         if steps_per_second < rp.steps_per_second_min:
-            raise SystemExit(
+            raise PolicyStop(
                 f"training-performance gate failed on {hardware_profile}: "
                 f"measured {steps_per_second:.3f} steps/s "
                 f"(allowed ≥ {rp.steps_per_second_min}); wall {total_s:.0f}s / "

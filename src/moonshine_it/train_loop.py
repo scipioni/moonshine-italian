@@ -248,6 +248,22 @@ def stage_for_step(curriculum: list[dict], step: int) -> dict | None:
     return curriculum[-1] if curriculum else None
 
 
+def stage_index_for_step(curriculum: list[dict], step: int) -> int | None:
+    """Index of the stage stage_for_step would return, or None with no
+    curriculum. Used to detect a stage boundary: crossing one deliberately
+    changes the training distribution, so metrics either side of it are not
+    a continuous series.
+    """
+    if not curriculum:
+        return None
+    cumulative = 0
+    for i, stage in enumerate(curriculum):
+        cumulative += stage["steps"]
+        if step < cumulative:
+            return i
+    return len(curriculum) - 1
+
+
 def validate_curriculum(curriculum: list[dict], rows: list[dict]) -> list[dict]:
     """Validate curriculum stages against the prepared corpus (training-pipeline
     spec: "Curriculum stages must be effective against the prepared corpus").
@@ -276,7 +292,7 @@ def validate_curriculum(curriculum: list[dict], rows: list[dict]) -> list[dict]:
         count = admitted(bound)
         if i > 0 and count == prev_count:
             corpus_max = durations[-1] if durations else 0.0
-            raise SystemExit(
+            raise PolicyStop(
                 f"curriculum stage {i} ({stage.get('description', '')!r}, "
                 f"max_audio_s={bound}) admits the same {count} rows as the "
                 f"preceding stage (max_audio_s={prev_bound}) -- it is not an "
@@ -333,13 +349,40 @@ def check_iterate_not_regressed(current_wer: float, baseline_wer: float, *,
         return 0
     streak += 1
     if streak >= threshold:
-        raise SystemExit(
+        raise PolicyStop(
             f"iterate '{iterate}' WER has been worse than the "
             f"{baseline_wer:.2f}% baseline measured at this run's start for "
             f"{streak} consecutive evals (latest: {current_wer:.2f}%) -- this "
             f"metric cannot be trusted to order checkpoints (design Decision "
             f"1, fix-training-loop-defects)")
     return streak
+
+
+POLICY_STOP_EXIT_CODE = 3
+
+
+class PolicyStop(SystemExit):
+    """A deliberate refusal to continue -- a latch or gate saying "this run
+    should not go on" -- as distinct from a crash.
+
+    Both used to leave the process with exit status 1, which a restart
+    supervisor cannot tell apart from the amdgpu page fault. Measured
+    2026-08-28: the regression latch fired correctly at step 14,000 and
+    scripts/supervise_final_train.sh restarted the run ~127 times over eight
+    hours, re-running the same three failing evals each time. A policy stop
+    exits with POLICY_STOP_EXIT_CODE so a supervisor stops instead.
+
+    Remains a SystemExit so existing `raise SystemExit`-based latch handling
+    and tests keep working.
+    """
+
+    def __init__(self, message: str):
+        self.message = message
+        print(message, flush=True)
+        super().__init__(POLICY_STOP_EXIT_CODE)
+
+    def __str__(self) -> str:
+        return self.message
 
 
 def ensure_iterate(optimizer, name: str) -> None:
@@ -732,11 +775,40 @@ def train(
 
     step = start_step
     epoch = 0
-    regression_streak = 0
+    # The regression streak must outlive the process. It used to be a local
+    # initialized to 0 here, which on rocm12g made the latch a no-op: the
+    # amdgpu fault restarts the run every few minutes, resetting the counter
+    # long before it could reach REGRESSION_STREAK_THRESHOLD. Measured on
+    # this run -- evals at 8000, 9000 and 10000 were all worse than baseline
+    # (three in a row, which should have halted it) but landed in attempts
+    # 11, 12 and 12, so the streak never exceeded 2.
+    state_path = out_dir / "run_state.json"
+    run_state = (json.loads(state_path.read_text())
+                 if resume and state_path.exists() else {})
+    regression_streak = run_state.get("regression_streak", 0)
+    last_stage_index = run_state.get("stage_index")
+    if regression_streak:
+        print(f"  regression streak carried over: {regression_streak}")
+
+    def persist_run_state(streak: int, stage_index: int | None) -> None:
+        state_path.write_text(json.dumps(
+            {"regression_streak": streak, "stage_index": stage_index}, indent=2))
+
     t_start = time.time()
     while step < max_steps:
-        # curriculum: rebuild dataset view for the current stage
+        # curriculum: rebuild dataset view for the current stage.
+        #
+        # The stage is re-read here, once per pass over the current stage's
+        # view, and the inner loop breaks out the moment the stage index
+        # changes (see below). Without that break the boundary is only
+        # observed when the view is exhausted: stage 0 admits 144,493 rows,
+        # so a pass is ~18,061 steps, and a crash-free run resuming at 2,997
+        # would not enter stage 1 until step ~21,058 -- not the step 8,000
+        # the curriculum configures. On the live run only the amdgpu-fault
+        # restarts advanced it, because each restart recomputes the stage
+        # from the step it resumed at.
         stage = stage_for_step(rp.curriculum, step) if rp.curriculum else None
+        active_stage_index = stage_index_for_step(rp.curriculum, step)
         max_audio_s = stage["max_audio_s"] if stage else None
         if max_audio_s:
             view = Subset(dataset, [i for i, r in enumerate(dataset.rows)
@@ -847,20 +919,54 @@ def train(
                 # can verify the metric is its own (see save_checkpoint).
                 metrics["global_step"] = step
                 wer = metrics["eval_wer"]
-                regression_streak = check_iterate_not_regressed(
-                    wer, baseline_wer, iterate="y", streak=regression_streak)
+                # A curriculum boundary deliberately changes the training
+                # distribution, so evals either side of it are not one
+                # series. Measured across the stage 1->2 boundary at step
+                # 8000 (<=5s clips -> the full <=10s corpus): 82.15% at 7000,
+                # then 93.94% and 96.0%, recovering to 86.16% by 10000. The
+                # latch exists to catch a run persistently worse than its
+                # origin, not this transient, so the streak restarts here.
+                stage_index = stage_index_for_step(rp.curriculum, step)
+                if stage_index != last_stage_index:
+                    if last_stage_index is not None and regression_streak:
+                        print(f"  curriculum stage {last_stage_index} -> "
+                              f"{stage_index}: regression streak reset "
+                              f"(was {regression_streak})")
+                    regression_streak = 0
+                    last_stage_index = stage_index
+                # Record before judging. The latch raises, so an eval checked
+                # first is lost from the record exactly when it matters most:
+                # step 14,000's 84.67% -- the measurement that halted the run
+                # -- survived only in the training log.
                 writer.add_scalar("eval/wer", wer, step)
                 record_eval(out_dir, step, metrics)
                 print(f"  step {step} eval WER {wer:.1f}% "
                       f"(iterate=y, split={val_split_name}, n={metrics['eval_n']})",
                       flush=True)
+                regression_streak = check_iterate_not_regressed(
+                    wer, baseline_wer, iterate="y", streak=regression_streak)
+                persist_run_state(regression_streak, stage_index)
             if step % save_steps == 0:
                 torch.cuda.synchronize()  # scoped: settle the step before saving
-                metrics = locals().get("metrics", {}) or {}
-                save_checkpoint(model, proc, optimizer, out_dir, step, metrics)
+                # Saves are more frequent than evals, so most checkpoints have
+                # no metric of their own. Hand them an empty one rather than
+                # the previous eval's: trainer_state.json is the record of
+                # what a checkpoint scored, and copying a neighbour's number
+                # into it is how a metric stops describing its artifact.
+                m = locals().get("metrics", {}) or {}
+                save_checkpoint(model, proc, optimizer, out_dir, step,
+                                m if m.get("global_step") == step else {})
                 prune_checkpoints(out_dir, rp.keep_last_checkpoints,
                                   protected=protected_checkpoints)
-        epoch += 1
+            # Honour the configured stage boundary at the step it names,
+            # rather than whenever this stage's view happens to run out.
+            if stage_index_for_step(rp.curriculum, step) != active_stage_index:
+                print(f"  curriculum: stage {active_stage_index} -> "
+                      f"{stage_index_for_step(rp.curriculum, step)} at step "
+                      f"{step}, rebuilding the dataset view", flush=True)
+                break
+        else:
+            epoch += 1
 
     metrics = locals().get("metrics", {}) or {}
     save_checkpoint(model, proc, optimizer, out_dir, step, metrics)
@@ -878,7 +984,7 @@ def train(
     (out_dir / "run_metadata.json").write_text(json.dumps(meta, indent=2))
     if rp.steps_per_second_min is not None and done_steps > 0:
         if steps_per_second < rp.steps_per_second_min:
-            raise SystemExit(
+            raise PolicyStop(
                 f"training-performance gate failed on {hardware_profile}: "
                 f"measured {steps_per_second:.3f} steps/s "
                 f"(allowed ≥ {rp.steps_per_second_min}); wall {total_s:.0f}s / "

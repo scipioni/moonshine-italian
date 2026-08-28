@@ -44,7 +44,8 @@ def evaluate_ort(
     if limit:
         rows = rows[:limit]
     refs, hyps, stats_all = [], [], []
-    for row in rows:
+    total = len(rows)
+    for i, row in enumerate(rows):
         audio = load_audio(audio_root / row["audio"])
         ref = normalize_text(row["text"], expand_nums=False)
         hyp, stats = pipe.transcribe_streaming(
@@ -57,6 +58,10 @@ def evaluate_ort(
         refs.append(ref)
         hyps.append(hyp)
         stats_all.append(stats)
+        if (i + 1) % 5 == 0 or (i + 1) == total:
+            import sys
+            sys.stdout.write(f"  [ort-eval] {i + 1}/{total} evaluated\n")
+            sys.stdout.flush()
 
     wer = float(jiwer.wer(refs, hyps)) * 100
     cer = float(jiwer.cer(refs, hyps)) * 100

@@ -266,7 +266,8 @@ def prepare_split(
             stats["dropped_nospeech"] += 1
             continue
 
-        text_field = ex.get("transcription") or ex.get("transcript") or ex.get("text") or ""
+        text_field = (ex.get("transcription") or ex.get("transcript") or 
+                      ex.get("raw_text") or ex.get("normalized_text") or ex.get("text") or "")
         text = normalize_text(
             text_field,
             lowercase=norm_cfg.get("lowercase", True),
@@ -302,6 +303,8 @@ def prepare_split(
             })
             stats["kept"] += 1
             count += 1
+            if count % 1000 == 0:
+                print(f"  [{dataset_name}/{split_name}] processed {count} chunks...")
 
     with open(manifest, "w") as fh:
         for row in rows:
@@ -422,7 +425,7 @@ SPLITS = {"train": "train", "validation": "validation", "test": "test"}
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="fleurs", choices=["fleurs", "mls", "common_voice"])
+    parser.add_argument("--dataset", default="fleurs", choices=["fleurs", "mls", "common_voice", "voxpopuli"])
     parser.add_argument("--limit", type=int, default=None, help="cap utterances (smoke)")
     parser.add_argument("--force", action="store_true",
                         help="re-prepare even if split manifests already exist")

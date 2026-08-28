@@ -76,6 +76,11 @@ datasets:
         train: "italian/train-*.parquet"
         validation: "italian/dev-*.parquet"
         test: "italian/test-*.parquet"
+  voxpopuli:
+    repo: "facebook/voxpopuli"
+    config: "it"
+    enabled: true
+    gated: false
   common_voice:
     repo: "mozilla-foundation/common_voice_21_0"   # kept for reference; unreachable, see note
     config: "it"
@@ -232,7 +237,7 @@ training:
       # set the release gates measure against). In-loop eval stays on
       # mls/validation.jsonl regardless of this list, so the eval/wer curve
       # stays comparable step-to-step as the mix changes.
-      datasets: ["mls", "common_voice", "fleurs"]
+      datasets: ["mls", "common_voice", "fleurs", "voxpopuli"]
       # Resolved fix-training-loop-defects design Decision 5 by measurement:
       # trimmed to the curriculum's one effective transition rather than
       # raising preparation.max_duration_s and re-preparing. Measured

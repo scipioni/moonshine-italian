@@ -88,6 +88,7 @@ DATASETS = {
     "fleurs": ("google/fleurs", "it_it", False),
     "mls": ("facebook/multilingual_librispeech", "italian", False),
     "common_voice": ("mozilla-foundation/common_voice_21_0", "it", True),
+    "voxpopuli": ("facebook/voxpopuli", "it", False),
 }
 
 
@@ -239,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
             download_data(cfg, name, force=force)
         return 0
     raise SystemExit(
-        "usage: download.py [model | data <fleurs|mls|common_voice>... [--force]]"
+        "usage: download.py [model | data <fleurs|mls|common_voice|voxpopuli>... [--force]]"
     )
 
 

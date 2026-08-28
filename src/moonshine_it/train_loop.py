@@ -934,14 +934,18 @@ def train(
                               f"(was {regression_streak})")
                     regression_streak = 0
                     last_stage_index = stage_index
-                regression_streak = check_iterate_not_regressed(
-                    wer, baseline_wer, iterate="y", streak=regression_streak)
-                persist_run_state(regression_streak, stage_index)
+                # Record before judging. The latch raises, so an eval checked
+                # first is lost from the record exactly when it matters most:
+                # step 14,000's 84.67% -- the measurement that halted the run
+                # -- survived only in the training log.
                 writer.add_scalar("eval/wer", wer, step)
                 record_eval(out_dir, step, metrics)
                 print(f"  step {step} eval WER {wer:.1f}% "
                       f"(iterate=y, split={val_split_name}, n={metrics['eval_n']})",
                       flush=True)
+                regression_streak = check_iterate_not_regressed(
+                    wer, baseline_wer, iterate="y", streak=regression_streak)
+                persist_run_state(regression_streak, stage_index)
             if step % save_steps == 0:
                 torch.cuda.synchronize()  # scoped: settle the step before saving
                 # Saves are more frequent than evals, so most checkpoints have
